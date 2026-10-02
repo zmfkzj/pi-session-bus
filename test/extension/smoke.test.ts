@@ -9,20 +9,22 @@
 
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   createEndpoint,
   createNote,
+  deriveId,
   FrameDecoder,
   helloProbe,
-  listEntries,
+  listSockets,
   sendNote,
+  socketFileName,
   type Endpoint,
   type NoteRequest,
-  type RegistryEntry,
+  type SocketEntry,
 } from "../../src/core/index.ts";
 import { makeTempDir, removeTempDir } from "../core/helpers.ts";
 
@@ -41,7 +43,7 @@ describe("smoke: real pi in rpc mode", { skip: ENABLED ? false : "opt-in: set SE
   let stderr = "";
   const records: Record_[] = [];
   let peer: Endpoint | undefined;
-  let entry: RegistryEntry;
+  let entry: SocketEntry;
   let requestSerial = 0;
 
   async function waitFor<T>(what: string, probe: () => T | undefined, timeoutMs = 20_000): Promise<T> {
@@ -96,22 +98,22 @@ describe("smoke: real pi in rpc mode", { skip: ENABLED ? false : "opt-in: set SE
     removeTempDir(tmp);
   });
 
-  it("publishes a registry entry and a socket (0600) in the private bus dir (0700)", async () => {
-    entry = await waitFor("the registry entry", () => listEntries(busDir)[0]);
-    await waitFor("the socket", () => (existsSync(entry.socket) ? true : undefined));
+  it("publishes a socket <id>-<pid>.sock (0600) and nothing else in the private bus dir (0700)", async () => {
+    entry = await waitFor("the socket", () => listSockets(busDir)[0]);
     assert.equal(entry.pid, child.pid);
     assert.match(entry.id, /^[0-9a-f]{8}$/);
-    assert.equal(entry.socket, join(busDir, `${entry.id}.sock`));
+    assert.equal(entry.path, join(busDir, `${entry.id}-${child.pid}.sock`));
+    assert.equal(entry.path, join(busDir, socketFileName(entry.id, entry.pid)));
     assert.equal(mode(busDir), 0o700);
-    assert.equal(mode(join(busDir, `${entry.id}.json`)), 0o600);
-    assert.equal(mode(entry.socket), 0o600);
-    assert.equal(listEntries(busDir).length, 1);
+    assert.equal(mode(entry.path), 0o600);
+    assert.equal(listSockets(busDir).length, 1);
+    assert.deepEqual(readdirSync(busDir), [`${entry.id}-${child.pid}.sock`], "the socket is the whole registry (no .json)");
   });
 
   it("answers a hello probe with live data", async () => {
-    const hello = await helloProbe(entry.socket);
+    const hello = await helloProbe(entry.path);
     assert.equal(hello.id, entry.id);
-    assert.equal(hello.sessionId, entry.sessionId);
+    assert.equal(hello.id, deriveId(hello.sessionId, hello.pid), "the id derives from session id + pid");
     assert.equal(hello.pid, child.pid);
     assert.equal(hello.cwd, realpathSync(cwd));
     assert.equal(hello.receiving, true);
@@ -126,7 +128,7 @@ describe("smoke: real pi in rpc mode", { skip: ENABLED ? false : "opt-in: set SE
       content: "smoke: this note is past the hop limit",
       hops: 5,
     });
-    const response = await sendNote(entry.socket, note);
+    const response = await sendNote(entry.path, note);
     assert.deepEqual(response, { v: 1, ok: true, status: "delivered", wake: "suppressed", reason: "hop_limit" });
 
     const reply = await rpc({ type: "get_messages" });
@@ -182,7 +184,7 @@ describe("smoke: real pi in rpc mode", { skip: ENABLED ? false : "opt-in: set SE
     assert.equal(records.some((r) => r.type === "agent_start"), false, "still no agent run");
   });
 
-  it("closing stdin shuts down cleanly and removes the socket and the registry entry", async () => {
+  it("closing stdin shuts down cleanly and removes the socket", async () => {
     child.stdin.end();
     let timer: NodeJS.Timeout | undefined;
     const result = await Promise.race([
@@ -192,12 +194,16 @@ describe("smoke: real pi in rpc mode", { skip: ENABLED ? false : "opt-in: set SE
       }),
     ]).finally(() => clearTimeout(timer));
     assert.equal(result.code, 0, `exit code (stderr: ${stderr})`);
-    assert.equal(existsSync(entry.socket), false, "socket removed");
-    assert.equal(existsSync(join(busDir, `${entry.id}.json`)), false, "registry entry removed");
+    assert.equal(existsSync(entry.path), false, "socket removed");
     assert.deepEqual(
-      listEntries(busDir).map((e) => e.id),
+      listSockets(busDir).map((e) => e.id),
       peer ? [peer.id] : [],
       "only the in-process test peer remains",
+    );
+    assert.deepEqual(
+      readdirSync(busDir),
+      peer ? [`${peer.id}-${process.pid}.sock`] : [],
+      "no other file is left (no .json)",
     );
   });
 });

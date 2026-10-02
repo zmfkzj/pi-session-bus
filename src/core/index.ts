@@ -5,8 +5,8 @@
  *             createNote, rejected, formatNoteText (model-facing framed text)
  *   policy    WakePolicy (+ MAX_HOPS, MAX_WAKES_PER_MINUTE, WAKE_WINDOW_MS)
  *   resolve   resolveTarget(query, self, peers) -> ok | self | unknown | ambiguous
- *   registry  resolveBusDir, ensurePrivateDir (BusDirError), deriveId, prepareSocketPath,
- *             writeEntry/readEntry/listEntries/removeEntry
+ *   registry  resolveBusDir, ensurePrivateDir (BusDirError), deriveId, socketFileName/parseSocketFileName,
+ *             fallbackDir, prepareSocketPath, listSockets (SocketEntry), removeSocket (the socket dir is the registry)
  *   endpoint  createEndpoint (server) and helloProbe/sendNote/listPeers (client, BusClientError)
  */
 

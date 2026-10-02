@@ -5,7 +5,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
@@ -26,7 +26,7 @@ import {
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { listEntries } from "../../src/core/index.ts";
+import { deriveId, listSockets, socketFileName } from "../../src/core/index.ts";
 import { createSessionBusExtension, type SessionBusOptions } from "../../src/index.ts";
 import { makeTempDir, removeTempDir } from "../core/helpers.ts";
 
@@ -83,7 +83,8 @@ afterEach(async () => {
     await node.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
     node.session.dispose();
   }
-  assert.deepEqual(listEntries(busDir), [], "every endpoint must remove its registry entry on shutdown");
+  assert.deepEqual(listSockets(busDir), [], "every endpoint must remove its socket on shutdown");
+  assert.deepEqual(existsSync(busDir) ? readdirSync(busDir) : [], [], "and nothing else is left in the bus dir");
   removeTempDir(tmp);
 });
 
@@ -149,9 +150,13 @@ async function makeNode(
       );
     },
     id() {
-      const entry = listEntries(busDir).find((e) => e.sessionId === session.sessionId);
-      assert.ok(entry, `${name} has a registry entry`);
-      return entry.id;
+      // The socket file <id>-<pid>.sock is the whole registration; the id derives from session id + pid.
+      const id = deriveId(session.sessionId, process.pid);
+      const entry = listSockets(busDir).find((e) => e.id === id);
+      assert.ok(entry, `${name} has a socket`);
+      assert.equal(entry.pid, process.pid);
+      assert.equal(entry.path, join(busDir, socketFileName(id, process.pid)));
+      return id;
     },
   };
   session.subscribe((event) => {
@@ -368,13 +373,13 @@ describe("two real Pi sessions on one bus", () => {
     assert.match(String(atB[1]!.content), /\nAuto-wake suppressed: hop_limit\.\n/);
   });
 
-  it("an unreachable id and the registry are cleaned up when a session shuts down", async () => {
+  it("an unreachable id and the socket are cleaned up when a session shuts down", async () => {
     const a = await makeNode("alpha");
     const b = await makeNode("beta");
     const bId = b.id();
-    assert.equal(listEntries(busDir).length, 2);
+    assert.equal(listSockets(busDir).length, 2);
     await b.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
-    assert.deepEqual(listEntries(busDir).map((e) => e.id), [a.id()]);
+    assert.deepEqual(listSockets(busDir).map((e) => e.id), [a.id()]);
     a.script([() => call("session_send", { to: bId, content: "are you there?" }), () => say("ok")]);
     await a.session.prompt("ping beta");
     const [send] = toolResults(a, "session_send");

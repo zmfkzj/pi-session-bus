@@ -73,7 +73,7 @@ Other limits: 64 KiB per frame, 32 KiB of message content, 3 s idle timeout per 
 
 ## Security model
 
-- **Same user only.** The bus directory is created `0700`, sockets and registry entries `0600`. A symbolic link or a directory owned by another user is refused: the endpoint is disabled and you get one notification. If the socket path would exceed the OS limit (103 bytes), a private directory `${XDG_RUNTIME_DIR or the temp dir}/pi-session-bus-<uid>/` is used with the same checks.
+- **Same user only.** The bus directory is created `0700` and the sockets `0600`; there are no other files (no registry entries). A symbolic link or a directory owned by another user is refused: the endpoint is disabled and you get one notification. If the socket path would exceed the OS limit (103 bytes), a private directory `${XDG_RUNTIME_DIR or the temp dir}/pi-session-bus-<uid>/<hash>/` is used, with the same checks on both of its levels.
 - **Any process running as your user can message your sessions** and can read the bus directory. There is no authentication beyond file permissions, and no cross-user or network transport.
 - **Peer messages are untrusted input.** They are framed as coming from a peer agent, not from you, and the agent is told not to take destructive or out-of-scope actions only because a peer asked. Treat the setup like any other prompt-injection surface: a message can still influence the agent.
 - Peers can only send notes. There are no control messages: nothing can stop, redirect or abort another session.
@@ -81,12 +81,15 @@ Other limits: 64 KiB per frame, 32 KiB of message content, 3 s idle timeout per 
 
 ## Protocol and files
 
-Files, by default under `<agent dir>/session-bus/` (`$PI_SESSION_BUS_DIR` overrides it):
+The socket directory is the registry: a session registers by binding a socket there, and listing peers means reading the directory. Files, by default under `<agent dir>/session-bus/` (`$PI_SESSION_BUS_DIR` overrides it):
 
-- `<id>.sock` — the Unix socket (`0600`).
-- `<id>.json` — the registry entry `{v:1, id, sessionId, pid, socket, startedAt}` (`0600`, written atomically). The socket path is recorded as an absolute path.
+- `<id>-<pid>.sock` — the Unix socket (`0600`), the only file a session creates. `<pid>` is the pid of the owning process (decimal, no leading zero). Only names that match `^[0-9a-f]{8}-[1-9][0-9]*\.sock$` and are real sockets are considered; regular files, symlinks and other names are ignored and never deleted.
 
-`id` is 8 lowercase hex characters derived from the session id and the process id, so it survives `/reload` but differs between two processes on the same session file. Live data (name, cwd, busy, auto-wake) comes from a `hello` probe, not from the registry; entries whose socket refuses the connection or no longer exists are deleted when listing. A timeout never prunes.
+If `<bus dir>/<id>-<pid>.sock` would exceed the 103-byte limit for socket paths, the socket is bound at `${XDG_RUNTIME_DIR or the temp dir}/pi-session-bus-<uid>/<hash>/<id>-<pid>.sock` instead. `<hash>` is the first 8 hex characters of the SHA-256 of the absolute bus dir, so buses with different bus dirs (tests, other setups) stay apart. Both levels are `0700` and checked like the bus dir. Listing reads the bus dir and, if it exists and is private to you, this directory.
+
+`id` is 8 lowercase hex characters derived from the session id and the process id, so it survives `/reload` but differs between two processes on the same session file. Live data (name, cwd, busy, auto-wake) comes from a `hello` probe; its `id` and `pid` must match the file name, otherwise the socket is skipped.
+
+Pruning: a socket file is deleted only when its pid no longer exists (`kill(pid, 0)` fails with `ESRCH`, no connection is made) or when the `hello` connect fails with `ENOENT` or `ECONNREFUSED`. A timeout, a rejection, a mismatching answer, `EPERM` or any other error never deletes anything. Only sockets are unlinked, and a starting session also removes the sockets of processes that are gone. Leftovers of the previous version (`<id>.sock` + `<id>.json` in the bus dir) are removed, as a pair, only when listing finds that the old `<id>.sock` in the bus dir refuses the `hello` connect or is gone. A live old session is left alone and not listed, and an old `<id>.json` without such a socket in the bus dir is never deleted.
 
 One request per connection. A frame is one line of JSON terminated by LF (UTF-8, at most 64 KiB; split on LF bytes only, never with `readline`):
 
@@ -110,6 +113,7 @@ Delivery calls `pi.sendMessage({customType: "session-bus.message", ...})` with `
 - Receiving needs a TUI or RPC session; `-p`/json runs can only send.
 - Ids change on `/new`, `/resume` and fork (a new session id); `/reload` keeps the id. The auto-wake toggle and the hop counter are per runtime and reset on `/reload`.
 - Messages go only to sessions that are running: nothing is stored or retried for sessions that are not.
+- Sessions running the previous version (JSON registry) and this version do not see each other; restart them to talk across versions.
 - The recipient's agent decides what to do with a message; delivery does not mean it was acted on.
 
 ## Development

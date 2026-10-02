@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readdirSync, symlinkSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, symlinkSync } from "node:fs";
 import { createServer, type Server } from "node:net";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import defaultFactory, { createSessionBusExtension, USAGE, type SessionBusOptions } from "../../src/index.ts";
 import {
@@ -10,15 +10,15 @@ import {
   deriveId,
   formatNoteText,
   helloProbe,
-  listEntries,
+  listSockets,
   MAX_HOPS,
   sendNote,
-  writeEntry,
+  socketFileName,
   type NoteRequest,
   type NoteResponse,
-  type RegistryEntry,
+  type SocketEntry,
 } from "../../src/core/index.ts";
-import { makeTempDir, removeTempDir } from "../core/helpers.ts";
+import { makeKilledChildSocket, makeStaleSocket, makeTempDir, removeTempDir } from "../core/helpers.ts";
 import { FakeHost, startPeer, type FakeHostOptions, type Peer } from "./helpers.ts";
 
 const DEFAULT_SESSION_ID = "11111111-aaaa-4bbb-8ccc-000000000001";
@@ -60,13 +60,13 @@ async function addPeer(sessionId: string, name?: string, onNote?: OnNote): Promi
   return peer;
 }
 
-function onlyEntry(): RegistryEntry {
-  const entries = listEntries(busDir);
-  assert.equal(entries.length, 1, `expected exactly one registry entry, got ${entries.length}`);
+function onlyEntry(): SocketEntry {
+  const entries = listSockets(busDir);
+  assert.equal(entries.length, 1, `expected exactly one socket, got ${entries.length}`);
   return entries[0]!;
 }
 
-function noteTo(entry: RegistryEntry, over: { hops?: number; wake?: boolean; content?: string; replyTo?: string } = {}): NoteRequest {
+function noteTo(entry: SocketEntry, over: { hops?: number; wake?: boolean; content?: string; replyTo?: string } = {}): NoteRequest {
   return createNote({
     from: { id: "feedc0de", sessionId: "sender-session", name: "sender", cwd: "/sender/cwd", replyable: true },
     to: entry.id,
@@ -119,10 +119,15 @@ describe("endpoint lifecycle", () => {
       const host = makeHost({ mode });
       await host.start();
       const entry = onlyEntry();
-      assert.equal(entry.sessionId, DEFAULT_SESSION_ID);
-      assert.equal(entry.id, deriveId(entry.sessionId, process.pid));
-      const peer = await helloProbe(entry.socket);
+      assert.equal(entry.id, deriveId(DEFAULT_SESSION_ID, process.pid));
+      assert.equal(entry.pid, process.pid);
+      assert.equal(basename(entry.path), `${entry.id}-${process.pid}.sock`);
+      assert.equal(entry.path, join(busDir, socketFileName(entry.id, process.pid)));
+      assert.deepEqual(readdirSync(busDir), [basename(entry.path)], "the socket is the only file (no registry json)");
+      const peer = await helloProbe(entry.path);
       assert.equal(peer.id, entry.id);
+      assert.equal(peer.pid, process.pid);
+      assert.equal(peer.sessionId, DEFAULT_SESSION_ID);
       assert.equal(peer.cwd, "/work/project");
       assert.equal(peer.receiving, true);
       assert.equal(peer.autoWake, true);
@@ -134,7 +139,7 @@ describe("endpoint lifecycle", () => {
     it(`starts no endpoint in ${mode} mode`, async () => {
       const host = makeHost({ mode });
       await host.start();
-      assert.deepEqual(listEntries(busDir), []);
+      assert.deepEqual(listSockets(busDir), []);
       assert.equal(existsSync(busDir) ? readdirSync(busDir).length : 0, 0);
     });
   }
@@ -142,22 +147,22 @@ describe("endpoint lifecycle", () => {
   it("honours the allowedModes option", async () => {
     const printHost = makeHost({ mode: "print" }, { allowedModes: ["print"] });
     await printHost.start();
-    assert.equal(listEntries(busDir).length, 1);
+    assert.equal(listSockets(busDir).length, 1);
     const tuiHost = makeHost({ mode: "tui", sessionId: "22222222-aaaa-4bbb-8ccc-000000000002" }, { allowedModes: ["print"] });
     await tuiHost.start();
-    assert.equal(listEntries(busDir).length, 1, "tui is not allowed here");
+    assert.equal(listSockets(busDir).length, 1, "tui is not allowed here");
   });
 
   it("hello reports the live name, cwd, busy and autoWake", async () => {
     const host = makeHost({ sessionName: "alpha", cwd: "/work/alpha" });
     await host.start();
     const entry = onlyEntry();
-    const first = await helloProbe(entry.socket);
+    const first = await helloProbe(entry.path);
     assert.deepEqual({ name: first.name, busy: first.busy }, { name: "alpha", busy: false });
     host.sessionName = "renamed";
     host.idle = false;
     await host.runCommand("wake off");
-    const peer = await helloProbe(entry.socket);
+    const peer = await helloProbe(entry.path);
     assert.equal(peer.name, "renamed");
     assert.equal(peer.busy, true);
     assert.equal(peer.autoWake, false);
@@ -170,20 +175,21 @@ describe("endpoint lifecycle", () => {
     await host.start("reload");
     const second = onlyEntry();
     assert.equal(second.id, first.id);
-    assert.equal(existsSync(second.socket), true);
+    assert.equal(existsSync(second.path), true);
   });
 
-  it("session_shutdown removes socket and entry, is idempotent, and makes no pi calls afterwards", async () => {
+  it("session_shutdown removes the socket (nothing is left behind), is idempotent, and makes no pi calls afterwards", async () => {
     const host = makeHost();
     await host.start();
     const entry = onlyEntry();
     await host.shutdown("reload");
-    assert.deepEqual(listEntries(busDir), []);
-    assert.equal(existsSync(entry.socket), false);
+    assert.deepEqual(listSockets(busDir), []);
+    assert.deepEqual(readdirSync(busDir), []);
+    assert.equal(existsSync(entry.path), false);
     // idempotent: a second shutdown event changes nothing and must not touch the dead runtime
     await host.fire("session_shutdown", { reason: "quit" });
     // the peer is gone: nobody can reach it any more
-    await assert.rejects(helloProbe(entry.socket), (err: unknown) => err instanceof BusClientError && err.code === "unreachable");
+    await assert.rejects(helloProbe(entry.path), (err: unknown) => err instanceof BusClientError && err.code === "unreachable");
     // late events must not reach pi either
     await host.fire("input", { source: "interactive", text: "hi" });
     assert.deepEqual(host.callsAfterDeath, [], `pi was called after shutdown: ${host.callsAfterDeath.join(", ")}`);
@@ -196,8 +202,8 @@ describe("endpoint lifecycle", () => {
       for (let i = 0; i < ticks; i++) await (i % 3 === 2 ? new Promise((r) => setImmediate(r)) : Promise.resolve());
       await host.shutdown();
       await starting;
-      assert.deepEqual(listEntries(busDir), [], `entries left after ${ticks} ticks`);
-      assert.equal(existsSync(busDir) ? readdirSync(busDir).filter((f) => f.endsWith(".sock")).length : 0, 0, `socket left after ${ticks} ticks`);
+      assert.deepEqual(listSockets(busDir), [], `sockets left after ${ticks} ticks`);
+      assert.deepEqual(existsSync(busDir) ? readdirSync(busDir) : [], [], `files left after ${ticks} ticks`);
       assert.deepEqual(host.callsAfterDeath, [], `pi called after shutdown (${ticks} ticks)`);
     }
   });
@@ -224,7 +230,7 @@ describe("delivery into the session", () => {
     await host.start();
     const entry = onlyEntry();
     const note = noteTo(entry, { replyTo: "orig-msg-1" });
-    const response = await sendNote(entry.socket, note);
+    const response = await sendNote(entry.path, note);
     assert.deepEqual(response, { v: 1, ok: true, status: "delivered", wake: "started" });
     assert.equal(host.sent.length, 1);
     const { message, options } = host.sent[0]!;
@@ -243,7 +249,7 @@ describe("delivery into the session", () => {
     await host.start();
     host.idle = false;
     const entry = onlyEntry();
-    const response = await sendNote(entry.socket, noteTo(entry));
+    const response = await sendNote(entry.path, noteTo(entry));
     assert.deepEqual(response, { v: 1, ok: true, status: "delivered", wake: "queued" });
     assert.deepEqual(host.sent[0]!.options, { triggerTurn: true, deliverAs: "steer" });
   });
@@ -253,13 +259,13 @@ describe("delivery into the session", () => {
     await host.start();
     const entry = onlyEntry();
     await host.runCommand("wake off");
-    const response = await sendNote(entry.socket, noteTo(entry));
+    const response = await sendNote(entry.path, noteTo(entry));
     assert.deepEqual(response, { v: 1, ok: true, status: "delivered", wake: "suppressed", reason: "wake_off" });
     assert.deepEqual(host.sent[0]!.options, { triggerTurn: false });
     assert.match(host.sent[0]!.message.content, /\nAuto-wake suppressed: wake_off\.\n/);
     assert.deepEqual(host.sent[0]!.message.details["reason"], "wake_off");
     await host.runCommand("wake on");
-    const again = await sendNote(entry.socket, noteTo(entry));
+    const again = await sendNote(entry.path, noteTo(entry));
     assert.equal(again.wake, "started");
     assert.deepEqual(host.sent[1]!.options, { triggerTurn: true, deliverAs: "steer" });
     // the tui footer shows the id and the wake state
@@ -272,24 +278,24 @@ describe("delivery into the session", () => {
     await host.start();
     const entry = onlyEntry();
 
-    const noWake = await sendNote(entry.socket, noteTo(entry, { wake: false }));
+    const noWake = await sendNote(entry.path, noteTo(entry, { wake: false }));
     assert.equal(noWake.wake, "suppressed");
     assert.equal(noWake.reason, "sender_no_wake");
 
-    const tooFar = await sendNote(entry.socket, noteTo(entry, { hops: 5 }));
+    const tooFar = await sendNote(entry.path, noteTo(entry, { hops: 5 }));
     assert.equal(tooFar.wake, "suppressed");
     assert.equal(tooFar.reason, "hop_limit");
     assert.match(host.sent[1]!.message.content, /hop 5\/4\]/);
 
-    assert.equal((await sendNote(entry.socket, noteTo(entry))).wake, "started");
-    assert.equal((await sendNote(entry.socket, noteTo(entry))).wake, "started");
-    const limited = await sendNote(entry.socket, noteTo(entry));
+    assert.equal((await sendNote(entry.path, noteTo(entry))).wake, "started");
+    assert.equal((await sendNote(entry.path, noteTo(entry))).wake, "started");
+    const limited = await sendNote(entry.path, noteTo(entry));
     assert.equal(limited.wake, "suppressed");
     assert.equal(limited.reason, "rate_limit");
 
     // only real wakes count, and the window slides
     clock += 61_000;
-    assert.equal((await sendNote(entry.socket, noteTo(entry))).wake, "started");
+    assert.equal((await sendNote(entry.path, noteTo(entry))).wake, "started");
 
     assert.deepEqual(
       host.sent.map((s) => s.options),
@@ -309,8 +315,8 @@ describe("delivery into the session", () => {
     await host.start();
     const entry = onlyEntry();
     const note = noteTo(entry);
-    assert.equal((await sendNote(entry.socket, note)).status, "delivered");
-    const dup = await sendNote(entry.socket, note);
+    assert.equal((await sendNote(entry.path, note)).status, "delivered");
+    const dup = await sendNote(entry.path, note);
     assert.equal(dup.status, "duplicate");
     assert.equal(host.sent.length, 1);
   });
@@ -320,7 +326,7 @@ describe("delivery into the session", () => {
     await host.start();
     const entry = onlyEntry();
     await assert.rejects(
-      sendNote(entry.socket, { ...noteTo(entry), to: "00000000" }),
+      sendNote(entry.path, { ...noteTo(entry), to: "00000000" }),
       (err: unknown) => err instanceof BusClientError && err.code === "rejected" && /wrong recipient/.test(err.reason ?? ""),
     );
     assert.deepEqual(host.sent, []);
@@ -341,7 +347,7 @@ describe("delivery into the session", () => {
 
     // a wake-worthy note with hops 3: pi refuses it
     await assert.rejects(
-      sendNote(entry.socket, noteTo(entry, { hops: 3 })),
+      sendNote(entry.path, noteTo(entry, { hops: 3 })),
       (err: unknown) => err instanceof BusClientError && err.code === "rejected" && /shutting down/.test(err.reason ?? ""),
     );
     assert.equal(attempts, 1);
@@ -353,7 +359,7 @@ describe("delivery into the session", () => {
 
     // the wake slot was not consumed (maxWakesPerMinute is 1): the next note still wakes
     pi.sendMessage = realSendMessage;
-    const retry = await sendNote(entry.socket, noteTo(entry, { hops: 3 }));
+    const retry = await sendNote(entry.path, noteTo(entry, { hops: 3 }));
     assert.equal(retry.status, "delivered");
     assert.equal(retry.wake, "started");
     assert.equal(host.sent.length, 1);
@@ -362,7 +368,7 @@ describe("delivery into the session", () => {
     // a successful delivery does account for both: the chain is now 3 and the one slot is used
     await host.runTool("session_send", { to: target.endpoint.id, content: "after the success" });
     assert.equal(target.notes.at(-1)!.hops, 4);
-    const limited = await sendNote(entry.socket, noteTo(entry));
+    const limited = await sendNote(entry.path, noteTo(entry));
     assert.equal(limited.wake, "suppressed");
     assert.equal(limited.reason, "rate_limit");
   });
@@ -375,7 +381,7 @@ describe("hop accounting", () => {
     const entry = onlyEntry();
     const target = await addPeer("target-session", "target");
 
-    await sendNote(entry.socket, noteTo(entry, { hops: 3 })); // chain is now 3
+    await sendNote(entry.path, noteTo(entry, { hops: 3 })); // chain is now 3
     await host.runTool("session_send", { to: target.endpoint.id, content: "one" });
     assert.equal(target.notes.at(-1)!.hops, 4);
 
@@ -391,7 +397,7 @@ describe("hop accounting", () => {
     await host.runTool("session_send", { to: target.endpoint.id, content: "three" });
     assert.equal(target.notes.at(-1)!.hops, 1);
 
-    await sendNote(entry.socket, noteTo(entry, { hops: 2 }));
+    await sendNote(entry.path, noteTo(entry, { hops: 2 }));
     await host.fire("input", { source: "rpc", text: "hi" });
     await host.runTool("session_send", { to: target.endpoint.id, content: "four" });
     assert.equal(target.notes.at(-1)!.hops, 1);
@@ -403,11 +409,11 @@ describe("hop accounting", () => {
     await sender.start();
     const receiver = makeHost({ sessionId: "22222222-aaaa-4bbb-8ccc-000000000002", sessionName: "recv" });
     await receiver.start();
-    const entries = listEntries(busDir);
-    const senderEntry = entries.find((e) => e.sessionId === DEFAULT_SESSION_ID)!;
-    const receiverEntry = entries.find((e) => e.sessionId !== DEFAULT_SESSION_ID)!;
+    const entries = listSockets(busDir);
+    const senderEntry = entries.find((e) => e.id === OWN_ID)!;
+    const receiverEntry = entries.find((e) => e.id !== OWN_ID)!;
 
-    const hostile = await sendNote(senderEntry.socket, noteTo(senderEntry, { hops: WIRE_MAX }));
+    const hostile = await sendNote(senderEntry.path, noteTo(senderEntry, { hops: WIRE_MAX }));
     assert.equal(hostile.status, "delivered");
     assert.equal(hostile.reason, "hop_limit");
 
@@ -447,11 +453,13 @@ describe("session_list", () => {
     const a = await addPeer("peer-a-session", "Alpha\nname");
     const dead = await addPeer("peer-dead-session", "Dead");
     const deadSocket = dead.endpoint.socketPath!;
-    // simulate a crashed process: socket file stays, nobody listens (the entry is left behind)
-    const deadEntry = listEntries(busDir).find((e) => e.id === dead.endpoint.id)!;
+    // simulate a crashed process: the socket file stays, nobody listens (the pid in its name is this live process)
     await dead.endpoint.stop();
-    writeEntry(busDir, deadEntry);
-    assert.equal(existsSync(deadSocket), false);
+    await makeStaleSocket(deadSocket);
+    assert.equal(lstatSync(deadSocket).isSocket(), true);
+    // and another one whose process is gone altogether
+    const gone = await makeKilledChildSocket(busDir, "dead0002");
+    assert.equal(lstatSync(gone.path).isSocket(), true);
 
     const result = await host.runTool("session_list", {});
     const text = result.content[0]!.text;
@@ -462,7 +470,9 @@ describe("session_list", () => {
     const details = result.details as { self: { id: string; receiving: boolean }; peers: { id: string; name?: string; sessionId: string }[] };
     assert.equal(details.self.receiving, true);
     assert.deepEqual(details.peers.map((p) => [p.id, p.sessionId]), [[a.endpoint.id, "peer-a-session"]]);
-    assert.equal(listEntries(busDir).some((e) => e.id === dead.endpoint.id), false, "stale entry pruned");
+    assert.equal(listSockets(busDir).some((e) => e.id === dead.endpoint.id), false, "stale socket pruned");
+    assert.equal(existsSync(deadSocket), false, "refused socket removed");
+    assert.equal(existsSync(gone.path), false, "socket of a vanished pid removed");
   });
 
   it("says so when there are no peers; /bus and /bus list print the same listing", async () => {
@@ -591,13 +601,14 @@ describe("session_send", () => {
   it("error: the peer disappears between hello and delivery (unreachable)", async () => {
     const host = makeHost();
     await host.start();
-    const socket = join(tmp, "flaky.sock");
+    const flakyId = "abcdef01";
+    const socket = join(busDir, socketFileName(flakyId, process.pid));
     const server = createServer((conn) => {
       conn.on("error", () => {});
       conn.on("data", (chunk) => {
         const request = JSON.parse(chunk.toString("utf8")) as { type: string };
         if (request.type === "hello") {
-          const peer = { id: "abcdef01", sessionId: "flaky-session", name: "flaky", cwd: "/x", pid: 1, busy: false, autoWake: true, receiving: true };
+          const peer = { id: flakyId, sessionId: "flaky-session", name: "flaky", cwd: "/x", pid: process.pid, busy: false, autoWake: true, receiving: true };
           conn.end(`${JSON.stringify({ v: 1, ok: true, peer })}\n`);
         } else {
           conn.destroy();
@@ -605,9 +616,8 @@ describe("session_send", () => {
       });
     });
     servers.push(server);
-    await new Promise<void>((resolve) => server.listen(socket, resolve));
     mkdirSync(busDir, { recursive: true, mode: 0o700 });
-    writeEntry(busDir, { v: 1, id: "abcdef01", sessionId: "flaky-session", pid: process.pid, socket, startedAt: new Date().toISOString() });
+    await new Promise<void>((resolve) => server.listen(socket, resolve));
     await assert.rejects(host.runTool("session_send", { to: "flaky", content: "x" }), /unreachable/);
   });
 });
@@ -617,7 +627,7 @@ describe("print/json mode senders", () => {
     const receiver = await addPeer("peer-session", "peer");
     const host = makeHost({ mode: "print", sessionId: "99999999-aaaa-4bbb-8ccc-000000000009", sessionName: "batch" });
     await host.start();
-    assert.equal(listEntries(busDir).length, 1, "only the peer is registered");
+    assert.equal(listSockets(busDir).length, 1, "only the peer has a socket");
     const result = await host.runTool("session_send", { to: "peer", content: "result of my batch job" });
     const note = receiver.notes[0]!;
     assert.equal(note.from.replyable, false);
@@ -626,7 +636,7 @@ describe("print/json mode senders", () => {
     const list = await host.runTool("session_list", {});
     assert.match(list.content[0]!.text, /not receiving/);
     assert.equal((list.details as { self: { receiving: boolean } }).self.receiving, false);
-    assert.equal(listEntries(busDir).length, 1);
+    assert.equal(listSockets(busDir).length, 1);
   });
 });
 
@@ -675,10 +685,10 @@ describe("/bus command", () => {
     await host.start();
     await host.runCommand("wake off");
     assert.match(host.lastNotification!.message, /auto-wake is off/);
-    assert.equal((await helloProbe(onlyEntry().socket)).autoWake, false);
+    assert.equal((await helloProbe(onlyEntry().path)).autoWake, false);
     await host.runCommand("WAKE ON");
     assert.match(host.lastNotification!.message, /auto-wake is on/);
-    assert.equal((await helloProbe(onlyEntry().socket)).autoWake, true);
+    assert.equal((await helloProbe(onlyEntry().path)).autoWake, true);
   });
 });
 

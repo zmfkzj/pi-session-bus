@@ -8,10 +8,11 @@ import {
   readFileSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { createConnection } from "node:net";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
   BusClientError,
@@ -30,8 +31,20 @@ import {
   type NoteRequest,
   type NoteResponse,
 } from "../../src/core/protocol.ts";
-import { writeEntry } from "../../src/core/registry.ts";
-import { listenSilent, makeStaleSocket, makeTempDir, rawExchange, removeTempDir } from "./helpers.ts";
+import { fallbackDir, socketFileName } from "../../src/core/registry.ts";
+import {
+  findDeadPid,
+  listenHello,
+  listenSilent,
+  listenWith,
+  makeKilledChildSocket,
+  makeStaleSocket,
+  makeTempDir,
+  peerInfo,
+  rawExchange,
+  removeTempDir,
+  type TestServer,
+} from "./helpers.ts";
 
 const mode = (path: string): number => statSync(path).mode & 0o777;
 const DELIVERED: NoteResponse = { v: 1, ok: true, status: "delivered", wake: "started" };
@@ -39,17 +52,32 @@ const DELIVERED: NoteResponse = { v: 1, ok: true, status: "delivered", wake: "st
 let tmp: string;
 let busDir: string;
 let endpoints: Endpoint[];
+let servers: TestServer[];
 
 beforeEach(() => {
   tmp = makeTempDir("sb-ep");
   busDir = join(tmp, "bus");
   endpoints = [];
+  servers = [];
 });
 
 afterEach(async () => {
   await Promise.all(endpoints.map((e) => e.stop()));
+  await Promise.all(servers.map((s) => s.close()));
   removeTempDir(tmp);
 });
+
+/** `<busDir>/<id>-<pid>.sock` (default: this process, which is alive). */
+const sock = (id: string, pid: number = process.pid): string => join(busDir, socketFileName(id, pid));
+const ensureBus = (): void => {
+  mkdirSync(busDir, { mode: 0o700, recursive: true });
+};
+/** Register a test server so afterEach closes it. */
+async function serve(server: Promise<TestServer>): Promise<TestServer> {
+  const s = await server;
+  servers.push(s);
+  return s;
+}
 
 interface Harness {
   endpoint: Endpoint;
@@ -95,23 +123,21 @@ async function rejection(promise: Promise<unknown>): Promise<BusClientError> {
 }
 
 describe("endpoint start", () => {
-  it("creates a 0700 bus dir, a 0600 socket and a 0600 registry entry", async () => {
+  it("creates a 0700 bus dir and a 0600 socket named <id>-<pid>.sock, and nothing else", async () => {
     const { endpoint } = makeEndpoint({ pid: 31337 });
     const entry = await endpoint.start();
     assert.equal(endpoint.running, true);
+    assert.deepEqual(endpoint.info, entry);
     assert.match(entry.id, /^[0-9a-f]{8}$/);
     assert.equal(entry.sessionId, "session-A");
     assert.equal(entry.pid, 31337);
-    assert.equal(entry.socket, join(busDir, `${entry.id}.sock`));
+    assert.equal(entry.socket, join(busDir, `${entry.id}-31337.sock`));
     assert.ok(!Number.isNaN(Date.parse(entry.startedAt)));
 
     assert.equal(mode(busDir), 0o700);
     assert.equal(mode(entry.socket), 0o600);
     assert.ok(statSync(entry.socket).isSocket());
-    const file = join(busDir, `${entry.id}.json`);
-    assert.equal(mode(file), 0o600);
-    assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), entry);
-    assert.deepEqual(readdirSync(busDir).sort(), [`${entry.id}.json`, `${entry.id}.sock`]);
+    assert.deepEqual(readdirSync(busDir), [`${entry.id}-31337.sock`]); // the socket is the whole registry: no .json
   });
 
   it("tightens a permissive bus dir we own", async () => {
@@ -132,6 +158,7 @@ describe("endpoint start", () => {
   });
 
   it("derives a stable id from sessionId + pid that differs between processes", async () => {
+    // (fake pids: only the ids matter here; b's start sweeps a's socket because pid 1001 does not exist)
     const a = makeEndpoint({ pid: 1001 }, "same-session");
     const b = makeEndpoint({ pid: 1002 }, "same-session");
     const [ea, eb] = [await a.endpoint.start(), await b.endpoint.start()];
@@ -403,7 +430,7 @@ describe("connection limits", () => {
   });
 });
 
-describe("stale pruning (listPeers)", () => {
+describe("listPeers", () => {
   it("lists live peers, excludes self, and reports live data", async () => {
     const a = makeEndpoint({}, "session-A");
     const b = makeEndpoint({ getPeerInfo: () => ({ name: "beta", cwd: "/work/b", busy: true, autoWake: false }) }, "session-B");
@@ -411,69 +438,152 @@ describe("stale pruning (listPeers)", () => {
     const eb = await b.endpoint.start();
     const fromA = await listPeers(busDir, ea.id);
     assert.deepEqual(
-      fromA.map((p) => [p.id, p.name, p.busy, p.autoWake, p.socket]),
-      [[eb.id, "beta", true, false, eb.socket]],
+      fromA.map((p) => [p.id, p.name, p.busy, p.autoWake, p.socket, p.pid]),
+      [[eb.id, "beta", true, false, eb.socket, process.pid]],
     );
     const fromNobody = await listPeers(busDir, undefined);
     assert.deepEqual(fromNobody.map((p) => p.id).sort(), [ea.id, eb.id].sort());
   });
 
-  it("prunes entries whose socket is gone (ENOENT) or refuses connections (ECONNREFUSED)", async () => {
+  it("reports the socket's mtime as startedAt and lists the oldest first", async () => {
+    const [ea, eb, ec] = [
+      await makeEndpoint({}, "session-A").endpoint.start(),
+      await makeEndpoint({}, "session-B").endpoint.start(),
+      await makeEndpoint({}, "session-C").endpoint.start(),
+    ];
+    utimesSync(ea.socket, 3000, 3000);
+    utimesSync(eb.socket, 1000, 1000);
+    utimesSync(ec.socket, 2000, 2000);
+    const peers = await listPeers(busDir, undefined);
+    assert.deepEqual(peers.map((p) => p.id), [eb.id, ec.id, ea.id]);
+    assert.deepEqual(peers.map((p) => p.startedAt), [
+      "1970-01-01T00:16:40.000Z",
+      "1970-01-01T00:33:20.000Z",
+      "1970-01-01T00:50:00.000Z",
+    ]);
+  });
+
+  it("(a) removes the socket of a SIGKILLed child process (its pid is gone) and does not list it", async () => {
     const live = makeEndpoint({}, "session-live");
     const el = await live.endpoint.start();
-
-    // ENOENT: registry entry without a socket file
-    writeEntry(busDir, { v: 1, id: "dead0001", sessionId: "s1", pid: 1, socket: join(busDir, "dead0001.sock"), startedAt: "2026-10-02T10:00:00.000Z" });
-    // ECONNREFUSED: socket file left behind by a killed process
-    const staleSock = join(busDir, "dead0002.sock");
-    await makeStaleSocket(staleSock);
-    writeEntry(busDir, { v: 1, id: "dead0002", sessionId: "s2", pid: 2, socket: staleSock, startedAt: "2026-10-02T10:00:01.000Z" });
-    assert.ok(existsSync(staleSock));
+    const dead = await makeKilledChildSocket(busDir, "dead0001"); // named <id>-<child pid>.sock
+    assert.equal(basename(dead.path), `dead0001-${dead.pid}.sock`);
+    assert.equal(lstatSync(dead.path).isSocket(), true);
+    assert.throws(() => process.kill(dead.pid, 0), { code: "ESRCH" });
 
     const peers = await listPeers(busDir, "00000000");
     assert.deepEqual(peers.map((p) => p.id), [el.id]);
-    assert.equal(existsSync(join(busDir, "dead0001.json")), false);
-    assert.equal(existsSync(join(busDir, "dead0002.json")), false);
-    assert.equal(existsSync(staleSock), false);
-    assert.equal(existsSync(join(busDir, `${el.id}.json`)), true);
+    assert.equal(existsSync(dead.path), false);
+    assert.equal(existsSync(el.socket), true);
   });
 
-  it("does not prune when pruning is disabled", async () => {
-    mkdirSync(busDir, { mode: 0o700, recursive: true });
-    writeEntry(busDir, {
-      v: 1, id: "dead0001", sessionId: "s1", pid: 1, socket: join(busDir, "dead0001.sock"), startedAt: "2026-10-02T10:00:00.000Z",
-    });
+  it("removes a stale socket whose pid is alive when connecting is refused (ECONNREFUSED)", async () => {
+    ensureBus();
+    const stale = sock("dead0002"); // this process: alive, so the pid check cannot decide
+    await makeStaleSocket(stale); // bound by a SIGKILLed child: the file stays, nobody listens
+    assert.equal(process.kill(process.pid, 0), true);
+    const err = await rejection(helloProbe(stale, 500));
+    assert.equal(err.errno, "ECONNREFUSED");
+    assert.equal(isStaleError(err), true);
+    assert.ok(existsSync(stale));
+
+    assert.deepEqual(await listPeers(busDir, undefined), []);
+    assert.equal(existsSync(stale), false);
+  });
+
+  it("(b) removes a socket named with a nonexistent pid without connecting to it", async () => {
+    ensureBus();
+    const pid = findDeadPid(); // 2^22-1 (or the next unused pid)
+    assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+    const path = sock("dead0003", pid);
+    const server = await serve(listenSilent(path)); // a live listener: only a connect attempt could tell
+    assert.deepEqual(await listPeers(busDir, undefined, { helloTimeoutMs: 50 }), []);
+    assert.equal(existsSync(path), false);
+    assert.equal(server.connections(), 0, "nobody connected");
+  });
+
+  it("(c) skips a live server whose hello answers another id or pid than its file name, and does not delete it", async () => {
+    ensureBus();
+    const match = await serve(listenHello(sock("c0de0001"), peerInfo("c0de0001", process.pid))); // control
+    const wrongId = await serve(listenHello(sock("c0de0002"), peerInfo("c0de00ff", process.pid)));
+    const wrongPid = await serve(listenHello(sock("c0de0003"), peerInfo("c0de0003", process.pid + 1)));
+
+    const peers = await listPeers(busDir, undefined);
+    assert.deepEqual(peers.map((p) => [p.id, p.pid, p.socket]), [["c0de0001", process.pid, sock("c0de0001")]]);
+    for (const id of ["c0de0001", "c0de0002", "c0de0003"]) assert.equal(existsSync(sock(id)), true, id);
+    assert.equal(match.connections(), 1);
+    assert.equal(wrongId.connections(), 1); // it was probed, answered, and skipped
+    assert.equal(wrongPid.connections(), 1);
+  });
+
+  it("(d) never deletes a regular file, symlink or directory named like a socket (listing and start sweep)", async () => {
+    ensureBus();
+    const dead = findDeadPid();
+    const target = join(tmp, "target.sock");
+    await makeStaleSocket(target); // a real stale socket, reachable only through a symlink
+    const regularDead = sock("f11e0001", dead);
+    const regularAlive = sock("f11e0002");
+    const directory = sock("f11e0003", dead);
+    const dangling = sock("f11e0004", dead);
+    const linked = sock("f11e0005");
+    writeFileSync(regularDead, "keep1");
+    writeFileSync(regularAlive, "keep2");
+    mkdirSync(directory);
+    symlinkSync(join(tmp, "nowhere"), dangling);
+    symlinkSync(target, linked);
+    const check = (when: string): void => {
+      assert.equal(readFileSync(regularDead, "utf8"), "keep1", when);
+      assert.equal(readFileSync(regularAlive, "utf8"), "keep2", when);
+      assert.equal(lstatSync(directory).isDirectory(), true, when);
+      assert.equal(lstatSync(dangling).isSymbolicLink(), true, when);
+      assert.equal(lstatSync(linked).isSymbolicLink(), true, when);
+      assert.equal(lstatSync(target).isSocket(), true, when);
+    };
+
+    const live = makeEndpoint({}, "session-live");
+    const el = await live.endpoint.start(); // the sweep runs here
+    check("after the start sweep");
+    assert.deepEqual((await listPeers(busDir, undefined)).map((p) => p.id), [el.id]);
+    check("after listPeers");
+  });
+
+  it("does not prune when pruning is disabled (not even legacy files)", async () => {
+    ensureBus();
+    const dead = await makeKilledChildSocket(busDir, "dead0004");
+    const aliveStale = sock("dead0005");
+    await makeStaleSocket(aliveStale);
+    const legacy = join(busDir, "1e9a0001.sock");
+    await makeStaleSocket(legacy);
+    writeFileSync(join(busDir, "1e9a0001.json"), "{}");
     assert.deepEqual(await listPeers(busDir, undefined, { prune: false }), []);
-    assert.equal(existsSync(join(busDir, "dead0001.json")), true);
+    for (const path of [dead.path, aliveStale, legacy, join(busDir, "1e9a0001.json")]) assert.equal(existsSync(path), true, path);
   });
 
   it("never prunes on a timeout", async () => {
-    mkdirSync(busDir, { mode: 0o700, recursive: true });
-    const sock = join(busDir, "slow0001.sock");
-    const silent = await listenSilent(sock);
-    try {
-      writeEntry(busDir, { v: 1, id: "slow0001", sessionId: "s", pid: 3, socket: sock, startedAt: "2026-10-02T10:00:00.000Z" });
-      const started = Date.now();
-      const peers = await listPeers(busDir, undefined, { helloTimeoutMs: 100 });
-      assert.deepEqual(peers, []);
-      assert.ok(Date.now() - started < 1500);
-      assert.equal(existsSync(join(busDir, "slow0001.json")), true);
-      assert.equal(existsSync(sock), true);
-      const err = await rejection(helloProbe(sock, 50));
-      assert.equal(err.code, "timeout");
-      assert.equal(isStaleError(err), false);
-    } finally {
-      await silent.close();
-    }
+    ensureBus();
+    const sockPath = sock("slow0001");
+    await serve(listenSilent(sockPath));
+    const started = Date.now();
+    const peers = await listPeers(busDir, undefined, { helloTimeoutMs: 100 });
+    assert.deepEqual(peers, []);
+    assert.ok(Date.now() - started < 1500);
+    assert.equal(existsSync(sockPath), true);
+    const err = await rejection(helloProbe(sockPath, 50));
+    assert.equal(err.code, "timeout");
+    assert.equal(isStaleError(err), false);
   });
 
-  it("skips (without pruning) an entry whose socket answers with another id", async () => {
-    const a = makeEndpoint({}, "session-A");
-    const ea = await a.endpoint.start();
-    writeEntry(busDir, { v: 1, id: "lie00001", sessionId: "s", pid: 4, socket: ea.socket, startedAt: "2026-10-02T10:00:00.000Z" });
-    const peers = await listPeers(busDir, undefined);
-    assert.deepEqual(peers.map((p) => p.id), [ea.id]);
-    assert.equal(existsSync(join(busDir, "lie00001.json")), true);
+  it("never prunes a peer that rejects the hello", async () => {
+    ensureBus();
+    const path = sock("bad00001");
+    const server = await serve(
+      listenWith(path, (s) => {
+        s.on("data", () => s.end(encodeFrame({ v: 1, ok: false, status: "rejected", reason: "nope" })));
+      }),
+    );
+    assert.deepEqual(await listPeers(busDir, undefined), []);
+    assert.equal(existsSync(path), true);
+    assert.equal(server.connections(), 1);
   });
 
   it("sendNote to a dead socket is 'unreachable' with a stale errno", async () => {
@@ -485,35 +595,179 @@ describe("stale pruning (listPeers)", () => {
   });
 
   it("sendNote times out against a silent peer", async () => {
-    mkdirSync(busDir, { mode: 0o700, recursive: true });
-    const silent = await listenSilent(join(busDir, "slow0002.sock"));
-    try {
-      const err = await rejection(sendNote(join(busDir, "slow0002.sock"), noteTo("00000000"), 100));
-      assert.equal(err.code, "timeout");
-    } finally {
-      await silent.close();
+    ensureBus();
+    await serve(listenSilent(sock("slow0002")));
+    const err = await rejection(sendNote(sock("slow0002"), noteTo("00000000"), 100));
+    assert.equal(err.code, "timeout");
+  });
+});
+
+describe("legacy cleanup (previous <id>.sock + <id>.json layout)", () => {
+  const legacySock = (id: string): string => join(busDir, `${id}.sock`);
+  const legacyJson = (id: string): string => join(busDir, `${id}.json`);
+
+  it("(e) removes a legacy socket nobody listens on together with its json when listing", async () => {
+    ensureBus();
+    await makeStaleSocket(legacySock("1e9a0001"));
+    writeFileSync(legacyJson("1e9a0001"), JSON.stringify({ v: 1, id: "1e9a0001" }));
+    const live = makeEndpoint({}, "session-live");
+    const el = await live.endpoint.start(); // start does not touch legacy files (the sweep only drops sockets of vanished pids)
+    assert.equal(existsSync(legacySock("1e9a0001")), true);
+    assert.equal(existsSync(legacyJson("1e9a0001")), true);
+
+    const peers = await listPeers(busDir, undefined);
+    assert.deepEqual(peers.map((p) => p.id), [el.id]);
+    assert.equal(existsSync(legacySock("1e9a0001")), false);
+    assert.equal(existsSync(legacyJson("1e9a0001")), false);
+    assert.equal(existsSync(el.socket), true);
+  });
+
+  it("leaves a live legacy session alone (socket and json) and does not list it", async () => {
+    ensureBus();
+    const server = await serve(listenHello(legacySock("1e9a0002"), peerInfo("1e9a0002", process.pid)));
+    writeFileSync(legacyJson("1e9a0002"), "{}");
+    assert.deepEqual(await listPeers(busDir, undefined), []);
+    assert.equal(server.connections(), 1); // it was probed
+    assert.equal(existsSync(legacySock("1e9a0002")), true);
+    assert.equal(existsSync(legacyJson("1e9a0002")), true);
+  });
+
+  it("leaves a legacy socket alone when the probe times out", async () => {
+    ensureBus();
+    await serve(listenSilent(legacySock("1e9a0003")));
+    writeFileSync(legacyJson("1e9a0003"), "{}");
+    assert.deepEqual(await listPeers(busDir, undefined, { helloTimeoutMs: 100 }), []);
+    assert.equal(existsSync(legacySock("1e9a0003")), true);
+    assert.equal(existsSync(legacyJson("1e9a0003")), true);
+  });
+
+  it("only touches sockets: a regular file named <id>.sock stays, with its json", async () => {
+    ensureBus();
+    writeFileSync(legacySock("1e9a0004"), "junk");
+    writeFileSync(legacyJson("1e9a0004"), "{}");
+    assert.deepEqual(await listPeers(busDir, undefined), []);
+    assert.equal(readFileSync(legacySock("1e9a0004"), "utf8"), "junk");
+    assert.equal(existsSync(legacyJson("1e9a0004")), true);
+  });
+
+  it("never lists a legacy json, with or without a socket", async () => {
+    ensureBus();
+    writeFileSync(legacyJson("1e9a0005"), JSON.stringify({ v: 1, id: "1e9a0005", sessionId: "s", pid: process.pid, socket: legacySock("1e9a0005"), startedAt: "2026-10-02T10:00:00.000Z" }));
+    assert.deepEqual(await listPeers(busDir, undefined), []);
+  });
+});
+
+describe("sweep after start", () => {
+  it("removes sockets of vanished pids, keeps everything that is not provably dead, and never connects", async () => {
+    ensureBus();
+    const deadPid = findDeadPid();
+    const killed = await makeKilledChildSocket(busDir, "dead0001"); // pid gone
+    const ghost = await serve(listenSilent(sock("dead0002", deadPid))); // pid gone, but something listens
+    const aliveStale = sock("dead0003"); // pid alive, nobody listens: unknown, so it stays
+    await makeStaleSocket(aliveStale);
+    const alive = await serve(listenSilent(sock("dead0004")));
+    writeFileSync(sock("dead0005", deadPid), "junk"); // not a socket
+    writeFileSync(join(busDir, "notes.txt"), "keep");
+
+    const info = await makeEndpoint({}, "session-new").endpoint.start();
+
+    assert.equal(existsSync(killed.path), false);
+    assert.equal(existsSync(sock("dead0002", deadPid)), false);
+    assert.equal(existsSync(aliveStale), true);
+    assert.equal(existsSync(sock("dead0004")), true);
+    assert.equal(readFileSync(sock("dead0005", deadPid), "utf8"), "junk");
+    assert.equal(readFileSync(join(busDir, "notes.txt"), "utf8"), "keep");
+    assert.equal(existsSync(info.socket), true);
+    assert.equal(ghost.connections(), 0, "the sweep never connects");
+    assert.equal(alive.connections(), 0, "the sweep never connects");
+  });
+
+  it("never removes the socket of the endpoint that is starting", async () => {
+    const pid = findDeadPid(); // our own pid is "gone" as far as the file name is concerned
+    const { endpoint } = makeEndpoint({ pid });
+    const info = await endpoint.start();
+    assert.equal(info.socket, sock(info.id, pid));
+    assert.equal(existsSync(info.socket), true);
+    assert.equal((await helloProbe(info.socket)).pid, pid);
+  });
+
+  it("never deletes a .json at start: orphan or not, legacy files are only cleaned up together with a stale busDir socket", async () => {
+    ensureBus();
+    writeFileSync(join(busDir, "1e9a0001.json"), "{}"); // no socket at all
+    await serve(listenSilent(join(busDir, "1e9a0002.sock"))); // old session still running
+    writeFileSync(join(busDir, "1e9a0002.json"), "{}");
+    writeFileSync(join(busDir, "notes.json"), "{}");
+    writeFileSync(join(busDir, "1E9A0003.json"), "{}"); // not an id
+    await makeEndpoint({}, "session-new").endpoint.start();
+    for (const name of ["1e9a0001.json", "1e9a0002.json", "1e9a0002.sock", "notes.json", "1E9A0003.json"]) {
+      assert.equal(existsSync(join(busDir, name)), true, `${name} after start`);
     }
+    // listing removes a json only together with the stale busDir socket of the same id, so these stay too
+    await listPeers(busDir, undefined, { helloTimeoutMs: 100 });
+    for (const name of ["1e9a0001.json", "1e9a0002.json", "1e9a0002.sock", "notes.json", "1E9A0003.json"]) {
+      assert.equal(existsSync(join(busDir, name)), true, `${name} after listPeers`);
+    }
+  });
+
+  it("keeps the .json of a live old session whose socket sits in the old fallback dir (<runtime>/pi-session-bus-<uid>/<id>.sock)", async () => {
+    ensureBus();
+    const runtime = join(tmp, "run");
+    const socketPath = { env: { XDG_RUNTIME_DIR: runtime } };
+    // previous layout: json in the bus dir, socket directly in <runtime>/pi-session-bus-<uid>/ (no hash level)
+    const oldDir = join(runtime, `pi-session-bus-${process.getuid?.()}`);
+    mkdirSync(oldDir, { recursive: true, mode: 0o700 });
+    const oldSocket = join(oldDir, "1e9a0006.sock");
+    const oldJson = join(busDir, "1e9a0006.json");
+    await serve(listenHello(oldSocket, peerInfo("1e9a0006", process.pid)));
+    writeFileSync(oldJson, JSON.stringify({ v: 1, id: "1e9a0006", sessionId: "old", pid: process.pid, socket: oldSocket, startedAt: "2026-10-02T10:00:00.000Z" }));
+
+    const info = await makeEndpoint({ socketPath }, "session-new").endpoint.start(); // the start sweep runs here
+    assert.equal(existsSync(oldJson), true, "json survives start()");
+    assert.equal(existsSync(oldSocket), true);
+
+    const peers = await listPeers(busDir, undefined, { socketPath });
+    assert.deepEqual(peers.map((p) => p.id), [info.id], "the old session is not listed");
+    assert.equal(existsSync(oldJson), true, "json survives listPeers");
+    assert.equal(existsSync(oldSocket), true);
   });
 });
 
 describe("EADDRINUSE recovery", () => {
-  it("reclaims a stale socket left by a dead process (same id)", async () => {
-    mkdirSync(busDir, { mode: 0o700, recursive: true });
+  it("reclaims a stale socket left by a dead process (same <id>-<pid> name)", async () => {
+    ensureBus();
     const { endpoint } = makeEndpoint({ id: "5eed0001" });
-    const stale = join(busDir, "5eed0001.sock");
+    const stale = sock("5eed0001");
     await makeStaleSocket(stale);
     assert.ok(existsSync(stale));
     const entry = await endpoint.start();
     assert.equal(entry.id, "5eed0001");
+    assert.equal(entry.socket, stale);
     assert.equal((await helloProbe(entry.socket)).id, "5eed0001");
     assert.equal(mode(entry.socket), 0o600);
   });
 
-  it("reclaims a leftover regular file at the socket path", async () => {
-    mkdirSync(busDir, { mode: 0o700, recursive: true });
-    writeFileSync(join(busDir, "5eed0002.sock"), "junk");
+  it("reclaims a stale socket even when the pid in its name is gone", async () => {
+    ensureBus();
+    const pid = findDeadPid();
+    const { endpoint } = makeEndpoint({ id: "5eed0003", pid });
+    const stale = sock("5eed0003", pid);
+    await makeStaleSocket(stale);
+    const entry = await endpoint.start();
+    assert.equal(entry.id, "5eed0003");
+    assert.equal(entry.socket, stale);
+    assert.equal((await helloProbe(entry.socket)).pid, pid);
+  });
+
+  it("keeps a regular file at the socket path (only sockets are unlinked) and salts the id instead", async () => {
+    ensureBus();
+    const path = sock("5eed0002");
+    writeFileSync(path, "junk");
     const { endpoint } = makeEndpoint({ id: "5eed0002" });
-    assert.equal((await endpoint.start()).id, "5eed0002");
+    const entry = await endpoint.start();
+    assert.notEqual(entry.id, "5eed0002");
+    assert.equal(entry.socket, sock(entry.id));
+    assert.equal(readFileSync(path, "utf8"), "junk");
+    assert.equal((await helloProbe(entry.socket)).id, entry.id);
   });
 
   it("picks another id when a live endpoint holds the first choice, and leaves it untouched", async () => {
@@ -524,6 +778,7 @@ describe("EADDRINUSE recovery", () => {
     assert.equal(e1.id, "11110000");
     assert.notEqual(e2.id, "11110000");
     assert.match(e2.id, /^[0-9a-f]{8}$/);
+    assert.equal(e2.socket, sock(e2.id));
     assert.equal((await helloProbe(e1.socket)).sessionId, "session-A");
     assert.equal((await helloProbe(e2.socket)).sessionId, "session-B");
     const peers = await listPeers(busDir, undefined);
@@ -535,28 +790,24 @@ describe("EADDRINUSE recovery", () => {
   });
 
   it("treats an unresponsive listener as live (does not steal its socket)", async () => {
-    mkdirSync(busDir, { mode: 0o700, recursive: true });
-    const silent = await listenSilent(join(busDir, "22220000.sock"));
-    try {
-      const { endpoint } = makeEndpoint({ id: "22220000", probeTimeoutMs: 100 });
-      const entry = await endpoint.start();
-      assert.notEqual(entry.id, "22220000");
-      assert.equal(existsSync(join(busDir, "22220000.sock")), true);
-    } finally {
-      await silent.close();
-    }
+    ensureBus();
+    const silent = await serve(listenSilent(sock("22220000")));
+    const { endpoint } = makeEndpoint({ id: "22220000", probeTimeoutMs: 100 });
+    const entry = await endpoint.start();
+    assert.notEqual(entry.id, "22220000");
+    assert.equal(existsSync(sock("22220000")), true);
+    assert.equal(silent.connections(), 1); // only the liveness probe
   });
 });
 
 describe("shutdown", () => {
-  it("removes socket and registry entry, is idempotent, and restores the exit listeners", async () => {
+  it("removes its socket (and leaves nothing else), is idempotent, and restores the exit listeners", async () => {
     const before = process.listenerCount("exit");
     const { endpoint } = makeEndpoint();
     const entry = await endpoint.start();
     assert.equal(process.listenerCount("exit"), before + 1);
     await endpoint.stop();
     assert.equal(existsSync(entry.socket), false);
-    assert.equal(existsSync(join(busDir, `${entry.id}.json`)), false);
     assert.equal(process.listenerCount("exit"), before);
     assert.equal(endpoint.running, false);
     await endpoint.stop(); // second call is a no-op
@@ -607,50 +858,80 @@ describe("shutdown", () => {
     await new Promise((r) => setTimeout(r, 20));
   });
 
-  it("leaves a newer endpoint's files alone when an old one stops late", async () => {
-    const old = makeEndpoint({ id: "99990000" }, "session-A");
-    const oldEntry = await old.endpoint.start();
-    // Simulate a successor that rewrote the registry entry for the same id.
-    writeEntry(busDir, { ...oldEntry, pid: oldEntry.pid + 1, startedAt: "2030-01-01T00:00:00.000Z" });
-    await old.endpoint.stop();
-    assert.equal(existsSync(join(busDir, "99990000.json")), true);
+  it("unlinks only its own socket: other sockets and files stay", async () => {
+    const a = makeEndpoint({}, "session-A");
+    const b = makeEndpoint({}, "session-B");
+    const ea = await a.endpoint.start();
+    const eb = await b.endpoint.start();
+    writeFileSync(join(busDir, "notes.txt"), "keep");
+    const lookalike = sock("5afe0001", findDeadPid()); // a regular file named like a socket
+    writeFileSync(lookalike, "keep");
+    await a.endpoint.stop();
+    assert.equal(existsSync(ea.socket), false);
+    assert.equal((await helloProbe(eb.socket)).id, eb.id);
+    assert.deepEqual(readdirSync(busDir).sort(), [basename(eb.socket), basename(lookalike), "notes.txt"].sort());
   });
 
-  it("process 'exit' cleanup removes the files synchronously", async () => {
+  it("process 'exit' cleanup removes the socket synchronously", async () => {
     const { endpoint } = makeEndpoint();
     const entry = await endpoint.start();
     const listeners = process.listeners("exit");
     const ours = listeners[listeners.length - 1] as () => void;
     ours(); // what Node would do at exit
-    assert.equal(existsSync(join(busDir, `${entry.id}.json`)), false);
     assert.equal(existsSync(entry.socket), false);
+    assert.deepEqual(readdirSync(busDir), []);
   });
 });
 
 describe("long socket paths", () => {
-  it("falls back to the private runtime dir when the bus path would exceed 103 bytes", async () => {
+  const uid = process.getuid?.();
+
+  it("falls back to <runtime>/pi-session-bus-<uid>/<hash of the bus dir> when the bus path would exceed 103 bytes", async () => {
     const longBus = join(tmp, "l".repeat(100), "bus");
     const runtime = join(tmp, "run");
     mkdirSync(runtime, { mode: 0o755 });
-    const { endpoint } = makeEndpoint({ busDir: longBus, socketPath: { env: { XDG_RUNTIME_DIR: runtime } } });
-    const entry = await endpoint.start();
-    const fallbackDir = join(runtime, `pi-session-bus-${process.getuid?.()}`);
-    assert.equal(entry.socket, join(fallbackDir, `${entry.id}.sock`));
-    assert.ok(Buffer.byteLength(entry.socket) <= 103);
-    assert.equal(mode(fallbackDir), 0o700);
-    assert.equal(mode(entry.socket), 0o600);
-    // the registry stays in the bus dir and records the absolute fallback socket
-    assert.equal(mode(join(longBus, `${entry.id}.json`)), 0o600);
-    assert.equal(JSON.parse(readFileSync(join(longBus, `${entry.id}.json`), "utf8")).socket, entry.socket);
-    assert.equal(existsSync(join(longBus, `${entry.id}.sock`)), false);
+    const socketPath = { env: { XDG_RUNTIME_DIR: runtime } };
+    const { endpoint } = makeEndpoint({ busDir: longBus, socketPath });
+    const info = await endpoint.start();
+    const dir = fallbackDir(longBus, socketPath);
+    assert.equal(info.socket, join(dir, `${info.id}-${process.pid}.sock`));
+    assert.equal(dirname(dir), join(runtime, `pi-session-bus-${uid}`));
+    assert.match(basename(dir), /^[0-9a-f]{8}$/);
+    assert.ok(Buffer.byteLength(info.socket) <= 103);
+    assert.equal(mode(dirname(dir)), 0o700);
+    assert.equal(mode(dir), 0o700);
+    assert.equal(mode(info.socket), 0o600);
+    // the socket is the only file anywhere: nothing (no .json) in the bus dir, nothing else in the fallback dir
+    assert.deepEqual(readdirSync(longBus), []);
+    assert.deepEqual(readdirSync(dir), [`${info.id}-${process.pid}.sock`]);
 
-    assert.equal((await helloProbe(entry.socket)).id, entry.id);
-    const peers = await listPeers(longBus, undefined);
-    assert.deepEqual(peers.map((p) => p.socket), [entry.socket]);
+    assert.equal((await helloProbe(info.socket)).id, info.id);
+    const peers = await listPeers(longBus, undefined, { socketPath });
+    assert.deepEqual(peers.map((p) => p.socket), [info.socket]);
+    // another bus dir has another hash: it does not see this endpoint
+    assert.deepEqual(await listPeers(join(tmp, "m".repeat(100), "bus"), undefined, { socketPath }), []);
 
     await endpoint.stop();
-    assert.equal(existsSync(entry.socket), false);
-    assert.equal(existsSync(join(longBus, `${entry.id}.json`)), false);
-    assert.equal(lstatSync(fallbackDir).isDirectory(), true);
+    assert.equal(existsSync(info.socket), false);
+    assert.equal(lstatSync(dir).isDirectory(), true);
+  });
+
+  it("sweeps and prunes dead sockets in the fallback dir too", async () => {
+    const longBus = join(tmp, "l".repeat(100), "bus");
+    const runtime = join(tmp, "run");
+    mkdirSync(runtime, { mode: 0o755 });
+    const socketPath = { env: { XDG_RUNTIME_DIR: runtime } };
+    const first = await makeEndpoint({ busDir: longBus, socketPath }, "session-A").endpoint.start();
+    const dir = dirname(first.socket);
+
+    const swept = await makeKilledChildSocket(dir, "dead0001");
+    assert.equal(existsSync(swept.path), true);
+    const second = await makeEndpoint({ busDir: longBus, socketPath }, "session-B").endpoint.start(); // start sweeps
+    assert.equal(existsSync(swept.path), false);
+
+    const pruned = await makeKilledChildSocket(dir, "dead0002");
+    const peers = await listPeers(longBus, undefined, { socketPath });
+    assert.deepEqual(peers.map((p) => p.id).sort(), [first.id, second.id].sort());
+    assert.equal(existsSync(pruned.path), false);
   });
 });

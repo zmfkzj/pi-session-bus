@@ -1,20 +1,34 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { createHash } from "node:crypto";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
   BusDirError,
   deriveId,
   ensurePrivateDir,
-  listEntries,
+  fallbackDir,
+  listSockets,
+  parseSocketFileName,
   prepareSocketPath,
-  readEntry,
-  removeEntry,
+  removeSocket,
   resolveBusDir,
-  writeEntry,
-  type RegistryEntry,
+  socketFileName,
+  type SocketEntry,
 } from "../../src/core/registry.ts";
-import { makeTempDir, removeTempDir } from "./helpers.ts";
+import { listenSilent, makeTempDir, removeTempDir, type TestServer } from "./helpers.ts";
 
 const mode = (path: string): number => statSync(path).mode & 0o777;
 
@@ -25,18 +39,6 @@ beforeEach(() => {
 afterEach(() => {
   removeTempDir(tmp);
 });
-
-function entry(id: string, overrides: Partial<RegistryEntry> = {}): RegistryEntry {
-  return {
-    v: 1,
-    id,
-    sessionId: `session-${id}`,
-    pid: 4242,
-    socket: join(tmp, `${id}.sock`),
-    startedAt: "2026-10-02T10:00:00.000Z",
-    ...overrides,
-  };
-}
 
 describe("resolveBusDir", () => {
   it("prefers PI_SESSION_BUS_DIR and does not call getAgentDir", () => {
@@ -128,105 +130,352 @@ describe("deriveId", () => {
   });
 });
 
-describe("prepareSocketPath", () => {
-  it("keeps short socket paths inside the bus dir", () => {
-    const busDir = join(tmp, "bus");
-    ensurePrivateDir(busDir);
-    assert.equal(prepareSocketPath(busDir, "abcd1234"), join(busDir, "abcd1234.sock"));
+describe("socketFileName / parseSocketFileName", () => {
+  it("builds <id>-<pid>.sock", () => {
+    assert.equal(socketFileName("abcd1234", 4242), "abcd1234-4242.sock");
   });
 
-  it("falls back to a private dir under XDG_RUNTIME_DIR when the path exceeds 103 bytes", () => {
+  it("round-trips", () => {
+    for (const [id, pid] of [
+      ["abcd1234", 1],
+      ["00000000", 4242],
+      ["ffffffff", 4_194_303],
+      [deriveId("s", 7), 99_999],
+    ] as const) {
+      assert.deepEqual(parseSocketFileName(socketFileName(id, pid)), { id, pid });
+    }
+  });
+
+  it("rejects everything that is not exactly <8 lowercase hex>-<pid without leading zero>.sock", () => {
+    for (const name of [
+      "abc.sock", // legacy / too short, no pid
+      "abcd1234.sock", // legacy format
+      "0123456789-0.sock", // id too long and pid 0
+      "abcd1234-0.sock", // pid 0
+      "abcd1234-042.sock", // leading zero
+      "abcd1234-.sock",
+      "abcd1234--5.sock",
+      "abcd1234-5x.sock",
+      "abcd1234-5.sock.bak",
+      "abcd1234-5.json",
+      "abcd1234-5",
+      ".json",
+      "ABCD1234-4242.sock", // uppercase id
+      "abcg1234-4242.sock", // not hex
+      "abcd123-4242.sock", // 7 characters
+      "abcd12345-4242.sock", // 9 characters
+      " abcd1234-4242.sock",
+      "abcd1234-4242.sock\n",
+      "abcd1234-99999999999999999999.sock", // not a safe integer
+      "",
+    ]) {
+      assert.equal(parseSocketFileName(name), undefined, JSON.stringify(name));
+    }
+  });
+});
+
+describe("fallbackDir", () => {
+  const hash8 = (dir: string): string => createHash("sha256").update(dir).digest("hex").slice(0, 8);
+  const uid = process.getuid?.();
+
+  it("is <runtime>/pi-session-bus-<uid>/<sha256-8 of the absolute busDir>", () => {
+    const busDir = join(tmp, "bus-one");
+    const dir = fallbackDir(busDir, { env: { XDG_RUNTIME_DIR: join(tmp, "run") } });
+    assert.equal(dir, join(tmp, "run", `pi-session-bus-${uid}`, hash8(busDir)));
+    assert.match(basename(dir), /^[0-9a-f]{8}$/);
+    assert.ok(dir.includes(hash8(busDir)));
+  });
+
+  it("differs for two busDirs and is stable for the same one", () => {
+    const options = { env: { XDG_RUNTIME_DIR: join(tmp, "run") } };
+    const a = fallbackDir(join(tmp, "bus-a"), options);
+    const b = fallbackDir(join(tmp, "bus-b"), options);
+    assert.notEqual(a, b);
+    assert.notEqual(basename(a), basename(b));
+    assert.equal(dirname(a), dirname(b)); // same shared per-user directory
+    assert.equal(fallbackDir(join(tmp, "bus-a"), options), a);
+  });
+
+  it("hashes the absolute path: a relative busDir and its absolute form agree", () => {
+    const options = { env: { XDG_RUNTIME_DIR: join(tmp, "run") } };
+    assert.equal(fallbackDir("rel/bus", options), fallbackDir(resolve("rel/bus"), options));
+  });
+
+  it("uses os.tmpdir() when XDG_RUNTIME_DIR is unset or empty, and the uid option", () => {
+    const busDir = join(tmp, "bus");
+    const expected = join(tmp, "pi-session-bus-1234", hash8(busDir));
+    assert.equal(fallbackDir(busDir, { env: {}, tmpdir: () => tmp, uid: 1234 }), expected);
+    assert.equal(fallbackDir(busDir, { env: { XDG_RUNTIME_DIR: "" }, tmpdir: () => tmp, uid: 1234 }), expected);
+  });
+
+  it("only computes the path: nothing is created", () => {
+    const runtime = join(tmp, "run");
+    fallbackDir(join(tmp, "bus"), { env: { XDG_RUNTIME_DIR: runtime } });
+    assert.equal(existsSync(runtime), false);
+  });
+});
+
+describe("prepareSocketPath", () => {
+  it("keeps short socket paths inside the bus dir and creates nothing", () => {
+    const busDir = join(tmp, "bus");
+    const runtime = join(tmp, "run");
+    assert.equal(prepareSocketPath(busDir, "abcd1234", 4242, { env: { XDG_RUNTIME_DIR: runtime } }), join(busDir, "abcd1234-4242.sock"));
+    assert.equal(existsSync(runtime), false);
+    assert.equal(existsSync(busDir), false);
+  });
+
+  it("falls back to <runtime>/pi-session-bus-<uid>/<hash> (both levels 0700) when the path exceeds 103 bytes", () => {
     const busDir = join(tmp, "x".repeat(110));
     const runtime = join(tmp, "run");
     mkdirSync(runtime, { mode: 0o755 });
-    const path = prepareSocketPath(busDir, "abcd1234", { env: { XDG_RUNTIME_DIR: runtime } });
-    const uid = process.getuid?.();
-    assert.equal(path, join(runtime, `pi-session-bus-${uid}`, "abcd1234.sock"));
-    assert.equal(mode(join(runtime, `pi-session-bus-${uid}`)), 0o700);
+    const options = { env: { XDG_RUNTIME_DIR: runtime } };
+    const path = prepareSocketPath(busDir, "abcd1234", 4242, options);
+    const dir = fallbackDir(busDir, options);
+    assert.equal(path, join(dir, "abcd1234-4242.sock"));
+    assert.equal(dirname(dirname(path)), join(runtime, `pi-session-bus-${process.getuid?.()}`));
+    assert.equal(mode(dirname(dir)), 0o700);
+    assert.equal(mode(dir), 0o700);
     assert.ok(Buffer.byteLength(path) <= 103);
+  });
+
+  it("uses the exact limit: 103 bytes stay in the bus dir, 104 move", () => {
+    const name = socketFileName("abcd1234", 4242);
+    const busDir = join(tmp, "b".repeat(103 - Buffer.byteLength(join(tmp, name)) - 1));
+    assert.equal(Buffer.byteLength(join(busDir, name)), 103);
+    const options = { env: { XDG_RUNTIME_DIR: join(tmp, "run") } };
+    assert.equal(prepareSocketPath(busDir, "abcd1234", 4242, options), join(busDir, name));
+    assert.equal(prepareSocketPath(`${busDir}b`, "abcd1234", 4242, options), join(fallbackDir(`${busDir}b`, options), name));
   });
 
   it("uses os.tmpdir() when XDG_RUNTIME_DIR is unset", () => {
     const busDir = join(tmp, "y".repeat(110));
-    const path = prepareSocketPath(busDir, "abcd1234", { env: {}, tmpdir: () => tmp });
-    assert.equal(path, join(tmp, `pi-session-bus-${process.getuid?.()}`, "abcd1234.sock"));
+    const options = { env: {}, tmpdir: () => tmp };
+    const path = prepareSocketPath(busDir, "abcd1234", 4242, options);
+    assert.equal(path, join(fallbackDir(busDir, options), "abcd1234-4242.sock"));
+    assert.equal(dirname(dirname(path)), join(tmp, `pi-session-bus-${process.getuid?.()}`));
   });
 
-  it("applies the same checks to the fallback dir (symlink refused)", () => {
+  it("gives two bus dirs two different fallback dirs", () => {
+    const options = { env: { XDG_RUNTIME_DIR: join(tmp, "run") } };
+    const a = prepareSocketPath(join(tmp, "a".repeat(110)), "abcd1234", 4242, options);
+    const b = prepareSocketPath(join(tmp, "c".repeat(110)), "abcd1234", 4242, options);
+    assert.notEqual(dirname(a), dirname(b));
+  });
+
+  it("applies the same checks to both fallback levels (symlink refused)", () => {
     const busDir = join(tmp, "z".repeat(110));
     const runtime = join(tmp, "run");
     mkdirSync(runtime);
     const target = join(tmp, "elsewhere");
     mkdirSync(target, { mode: 0o700 });
-    symlinkSync(target, join(runtime, `pi-session-bus-${process.getuid?.()}`));
+    const options = { env: { XDG_RUNTIME_DIR: runtime } };
+    const dir = fallbackDir(busDir, options);
+    symlinkSync(target, dirname(dir)); // first level
     assert.throws(
-      () => prepareSocketPath(busDir, "abcd1234", { env: { XDG_RUNTIME_DIR: runtime } }),
+      () => prepareSocketPath(busDir, "abcd1234", 4242, options),
       (err) => err instanceof BusDirError && err.code === "symlink",
+    );
+    rmSync(dirname(dir));
+    mkdirSync(dirname(dir), { mode: 0o700 });
+    symlinkSync(target, dir); // second level (the hash dir)
+    assert.throws(
+      () => prepareSocketPath(busDir, "abcd1234", 4242, options),
+      (err) => err instanceof BusDirError && err.code === "symlink",
+    );
+    assert.deepEqual(readdirSync(target), []);
+  });
+
+  it("refuses a fallback dir owned by another uid", () => {
+    const busDir = join(tmp, "o".repeat(110));
+    const me = process.getuid?.() ?? 0;
+    assert.throws(
+      () => prepareSocketPath(busDir, "abcd1234", 4242, { env: { XDG_RUNTIME_DIR: tmp }, uid: me + 1 }),
+      (err) => err instanceof BusDirError && err.code === "foreign_owner",
     );
   });
 
   it("fails clearly when even the fallback is too long", () => {
     const busDir = join(tmp, "w".repeat(110));
     assert.throws(
-      () => prepareSocketPath(busDir, "abcd1234", { env: { XDG_RUNTIME_DIR: join(tmp, "r".repeat(110)) } }),
+      () => prepareSocketPath(busDir, "abcd1234", 4242, { env: { XDG_RUNTIME_DIR: join(tmp, "r".repeat(110)) } }),
       (err) => err instanceof BusDirError && err.code === "path_too_long",
     );
   });
 });
 
-describe("registry entries", () => {
-  it("writes atomically with mode 0600 and leaves no temp files", () => {
-    const e = entry("aaaa0001");
-    writeEntry(tmp, e);
-    const file = join(tmp, "aaaa0001.json");
-    assert.equal(mode(file), 0o600);
-    assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), e);
-    assert.deepEqual(readdirSync(tmp), ["aaaa0001.json"]);
-    assert.deepEqual(readEntry(tmp, "aaaa0001"), e);
+describe("listSockets", () => {
+  let servers: TestServer[];
+  beforeEach(() => {
+    servers = [];
+  });
+  afterEach(async () => {
+    await Promise.all(servers.map((s) => s.close()));
   });
 
-  it("overwrites an existing entry in place", () => {
-    writeEntry(tmp, entry("aaaa0001", { pid: 1 }));
-    writeEntry(tmp, entry("aaaa0001", { pid: 2 }));
-    assert.equal(readEntry(tmp, "aaaa0001")?.pid, 2);
-    assert.deepEqual(readdirSync(tmp), ["aaaa0001.json"]);
+  /** A real Unix socket file at `path`. */
+  async function bind(path: string): Promise<void> {
+    servers.push(await listenSilent(path));
+  }
+
+  const names = (list: SocketEntry[]): string[] => list.map((e) => basename(e.path));
+
+  it("lists <id>-<pid>.sock sockets with id, pid, absolute path and mtimeMs", async () => {
+    const busDir = join(tmp, "bus");
+    ensurePrivateDir(busDir);
+    await bind(join(busDir, "aaaa0001-4242.sock"));
+    const [entry, ...rest] = listSockets(busDir);
+    assert.deepEqual(rest, []);
+    assert.ok(entry);
+    assert.deepEqual(Object.keys(entry).sort(), ["id", "mtimeMs", "path", "pid"]);
+    assert.equal(entry.id, "aaaa0001");
+    assert.equal(entry.pid, 4242);
+    assert.equal(entry.path, join(busDir, "aaaa0001-4242.sock"));
+    assert.equal(entry.mtimeMs, lstatSync(entry.path).mtimeMs);
   });
 
-  it("lists valid entries oldest first and skips junk", () => {
-    writeEntry(tmp, entry("bbbb0002", { startedAt: "2026-10-02T10:00:02.000Z" }));
-    writeEntry(tmp, entry("aaaa0001", { startedAt: "2026-10-02T10:00:01.000Z" }));
-    writeFileSync(join(tmp, "cccc0003.json"), "{not json");
-    writeFileSync(join(tmp, "dddd0004.json"), JSON.stringify(entry("eeee0005"))); // id does not match the file name
-    writeFileSync(join(tmp, "ffff0006.json"), JSON.stringify({ ...entry("ffff0006"), socket: "relative.sock" }));
-    writeFileSync(join(tmp, "notes.json"), "{}");
-    writeFileSync(join(tmp, ".aaaa0001.1.abcd.tmp"), "partial");
+  it("reads both the bus dir and the fallback dir", async () => {
+    const busDir = join(tmp, "bus");
+    const runtime = join(tmp, "run");
+    const options = { env: { XDG_RUNTIME_DIR: runtime } };
+    ensurePrivateDir(busDir);
+    const fallback = fallbackDir(busDir, options);
+    ensurePrivateDir(dirname(fallback));
+    ensurePrivateDir(fallback);
+    await bind(join(busDir, "aaaa0001-4242.sock"));
+    await bind(join(fallback, "bbbb0002-4243.sock"));
+    const list = listSockets(busDir, options);
+    assert.deepEqual(names(list).sort(), ["aaaa0001-4242.sock", "bbbb0002-4243.sock"]);
     assert.deepEqual(
-      listEntries(tmp).map((e) => e.id),
-      ["aaaa0001", "bbbb0002"],
+      list.map((e) => [e.id, e.pid, dirname(e.path)]).sort(),
+      [
+        ["aaaa0001", 4242, busDir],
+        ["bbbb0002", 4243, fallback],
+      ],
     );
-    assert.deepEqual(listEntries(join(tmp, "missing")), []);
+    // without the runtime dir the fallback is not read
+    assert.deepEqual(names(listSockets(busDir, { env: { XDG_RUNTIME_DIR: join(tmp, "other-run") } })), ["aaaa0001-4242.sock"]);
   });
 
-  it("removeEntry deletes the json and the socket path, tolerating missing files", () => {
-    const e = entry("aaaa0001");
-    writeEntry(tmp, e);
-    writeFileSync(e.socket, "");
-    removeEntry(tmp, e);
-    assert.deepEqual(readdirSync(tmp), []);
-    removeEntry(tmp, e); // idempotent
+  it("reads the fallback dir of this busDir only (another bus dir has its own hash)", async () => {
+    const runtime = join(tmp, "run");
+    const options = { env: { XDG_RUNTIME_DIR: runtime } };
+    const busA = join(tmp, "bus-a");
+    const busB = join(tmp, "bus-b");
+    const fallbackA = fallbackDir(busA, options);
+    ensurePrivateDir(dirname(fallbackA));
+    ensurePrivateDir(fallbackA);
+    await bind(join(fallbackA, "aaaa0001-4242.sock"));
+    assert.deepEqual(names(listSockets(busA, options)), ["aaaa0001-4242.sock"]);
+    assert.deepEqual(listSockets(busB, options), []);
   });
 
-  it("removeEntry also removes a socket in the fallback dir, but never an unrelated file", () => {
-    const other = join(tmp, "other");
-    mkdirSync(other);
-    const fallbackSock = join(other, "aaaa0001.sock");
-    const innocent = join(other, "important.txt");
-    writeFileSync(fallbackSock, "");
-    writeFileSync(innocent, "keep");
-    writeEntry(tmp, entry("aaaa0001", { socket: fallbackSock }));
-    removeEntry(tmp, { id: "aaaa0001", socket: fallbackSock });
-    assert.equal(existsSync(fallbackSock), false);
-    removeEntry(tmp, { id: "aaaa0001", socket: innocent });
-    assert.equal(existsSync(innocent), true);
+  it("ignores regular files, symlinks and directories that carry a matching name", async () => {
+    const busDir = join(tmp, "bus");
+    ensurePrivateDir(busDir);
+    await bind(join(busDir, "aaaa0001-4242.sock"));
+    writeFileSync(join(busDir, "bbbb0002-4243.sock"), "not a socket");
+    mkdirSync(join(busDir, "cccc0003-4244.sock"));
+    symlinkSync(join(busDir, "aaaa0001-4242.sock"), join(busDir, "dddd0004-4245.sock"));
+    symlinkSync(join(tmp, "nowhere"), join(busDir, "eeee0005-4246.sock")); // dangling
+    assert.deepEqual(names(listSockets(busDir)), ["aaaa0001-4242.sock"]);
+  });
+
+  it("ignores sockets whose names do not match (legacy, uppercase, no pid, extra suffix)", async () => {
+    const busDir = join(tmp, "bus");
+    ensurePrivateDir(busDir);
+    await bind(join(busDir, "aaaa0001-4242.sock"));
+    for (const name of ["aaaa0002.sock", "AAAA0003-4242.sock", "aaaa0004-0.sock", "aaaa0005-4242.sock.old", "notes-4242.sock", "aaaa0006-4242.json"]) {
+      await bind(join(busDir, name));
+    }
+    assert.deepEqual(names(listSockets(busDir)), ["aaaa0001-4242.sock"]);
+  });
+
+  it("ignores a fallback dir that is a symlink or owned by someone else", async () => {
+    const busDir = join(tmp, "bus");
+    const runtime = join(tmp, "run");
+    const options = { env: { XDG_RUNTIME_DIR: runtime } };
+    const real = join(tmp, "real");
+    ensurePrivateDir(real);
+    await bind(join(real, "aaaa0001-4242.sock"));
+    const fallback = fallbackDir(busDir, options);
+    ensurePrivateDir(dirname(fallback));
+    symlinkSync(real, fallback); // hash level is a symlink
+    assert.deepEqual(listSockets(busDir, options), []);
+
+    rmSync(fallback);
+    ensurePrivateDir(fallback);
+    await bind(join(fallback, "bbbb0002-4243.sock"));
+    assert.deepEqual(names(listSockets(busDir, options)), ["bbbb0002-4243.sock"]);
+    const me = process.getuid?.() ?? 0;
+    assert.deepEqual(listSockets(busDir, { ...options, uid: me + 1 }), []); // someone else's dir
+  });
+
+  it("returns oldest first (mtime, then id, then pid) and tolerates missing directories", async () => {
+    const busDir = join(tmp, "bus");
+    ensurePrivateDir(busDir);
+    const files: [string, number][] = [
+      ["cccc0003-10.sock", 1000],
+      ["bbbb0002-11.sock", 3000],
+      ["aaaa0001-12.sock", 3000],
+      ["aaaa0001-9.sock", 3000],
+      ["dddd0004-13.sock", 2000],
+    ];
+    for (const [name, seconds] of files) {
+      const path = join(busDir, name);
+      await bind(path);
+      utimesSync(path, seconds, seconds);
+    }
+    assert.deepEqual(names(listSockets(busDir)), [
+      "cccc0003-10.sock",
+      "dddd0004-13.sock",
+      "aaaa0001-9.sock",
+      "aaaa0001-12.sock",
+      "bbbb0002-11.sock",
+    ]);
+    assert.deepEqual(listSockets(join(tmp, "missing"), { env: { XDG_RUNTIME_DIR: join(tmp, "also-missing") } }), []);
+  });
+});
+
+describe("removeSocket", () => {
+  let servers: TestServer[];
+  beforeEach(() => {
+    servers = [];
+  });
+  afterEach(async () => {
+    await Promise.all(servers.map((s) => s.close()));
+  });
+
+  it("unlinks a socket and reports it", async () => {
+    const path = join(tmp, "aaaa0001-4242.sock");
+    servers.push(await listenSilent(path));
+    assert.equal(removeSocket(path), true);
+    assert.equal(existsSync(path), false);
+  });
+
+  it("refuses (does not unlink) a regular file", () => {
+    const path = join(tmp, "aaaa0001-4242.sock");
+    writeFileSync(path, "precious");
+    assert.equal(removeSocket(path), false);
+    assert.equal(readFileSync(path, "utf8"), "precious");
+  });
+
+  it("refuses a directory and a symlink (even one pointing to a socket)", async () => {
+    const dir = join(tmp, "adir.sock");
+    mkdirSync(dir);
+    assert.equal(removeSocket(dir), false);
+    assert.equal(lstatSync(dir).isDirectory(), true);
+
+    const real = join(tmp, "bbbb0002-4243.sock");
+    servers.push(await listenSilent(real));
+    const link = join(tmp, "cccc0003-4244.sock");
+    symlinkSync(real, link);
+    assert.equal(removeSocket(link), false);
+    assert.equal(lstatSync(link).isSymbolicLink(), true);
+    assert.equal(lstatSync(real).isSocket(), true);
+  });
+
+  it("returns false for a missing path without throwing", () => {
+    assert.equal(removeSocket(join(tmp, "missing-4242.sock")), false);
+    assert.equal(removeSocket(join(tmp, "no-such-dir", "x.sock")), false);
   });
 });

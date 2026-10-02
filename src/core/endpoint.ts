@@ -3,10 +3,12 @@
  *
  * SERVER  createEndpoint({busDir, sessionId, getPeerInfo, onNote, limits?}) -> Endpoint
  *   start()  creates/verifies the bus dir (0700), picks the id (derived from sessionId+pid),
- *            listens on <busDir>/<id>.sock (or the private fallback dir for long paths),
- *            chmods the socket 0600 and atomically writes <busDir>/<id>.json (0600).
- *            EADDRINUSE: probe the socket; refused/missing => stale: unlink and retry;
+ *            listens on <busDir>/<id>-<pid>.sock (or the private fallback dir for long paths) and
+ *            chmods the socket 0600. The socket file is the whole registry: nothing else is written.
+ *            EADDRINUSE: probe the socket; refused/missing => stale: unlink (sockets only) and retry;
  *            a live (or unresponsive) server => pick another id via a salt.
+ *            Afterwards a synchronous sweep removes the sockets of other processes whose pid no
+ *            longer exists (kill(pid, 0) => ESRCH); it never connects.
  *   Each connection carries exactly one request. A connection that exceeds the frame cap
  *   or stays idle longer than idleTimeoutMs without a complete frame is destroyed.
  *   Invalid requests, a wrong `to` and self-addressed notes are answered with a rejection.
@@ -14,18 +16,20 @@
  *   `duplicate` with the original wake status and does NOT call onNote again.
  *   stop()   idempotent. Removes the exit listener, answers in-flight requests with
  *            rejected "shutting down", destroys all connections, closes the server and
- *            unlinks socket + registry entry. Resolves once the server is closed.
+ *            unlinks our own socket. Resolves once the server is closed.
  *
  * CLIENT  helloProbe(socket, timeout) -> PeerInfo
  *         sendNote(socket, note, timeout) -> NoteDelivered
- *         listPeers(busDir, selfId) -> PeerRecord[]   (probes all entries with hello)
+ *         listPeers(busDir, selfId) -> PeerRecord[]   (hello-probes every socket except selfId's)
  *   Failures are BusClientError with code unreachable | rejected | timeout | too_large.
  *   `errno` carries the socket error code (e.g. ENOENT/ECONNREFUSED). Only those two
- *   (see isStaleError) make listPeers prune an entry; a timeout never does.
+ *   (see isStaleError) and a vanished pid (ESRCH) make listPeers remove a socket; a timeout, a
+ *   rejection or a hello answer whose id/pid differs from the file name never does.
  */
 
-import { chmodSync, unlinkSync } from "node:fs";
+import { chmodSync, lstatSync, readdirSync, unlinkSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { join } from "node:path";
 import {
   encodeFrame,
   FrameDecoder,
@@ -49,12 +53,9 @@ import {
 import {
   deriveId,
   ensurePrivateDir,
-  listEntries,
+  listSockets,
   prepareSocketPath,
-  readEntry,
-  removeEntry,
-  writeEntry,
-  type RegistryEntry,
+  removeSocket,
   type SocketPathOptions,
 } from "./registry.ts";
 
@@ -181,36 +182,93 @@ export interface PeerRecord extends PeerInfo {
 
 export interface ListPeersOptions {
   helloTimeoutMs?: number;
-  /** Delete registry entries of dead peers (ENOENT/ECONNREFUSED only). Default true. */
+  /** Remove sockets of dead peers (ESRCH, or ENOENT/ECONNREFUSED on hello only). Default true. */
   prune?: boolean;
+  /** Fallback-dir inputs (env, tmpdir, uid); must match the endpoints' `socketPath`. Default: process env. */
+  socketPath?: SocketPathOptions;
 }
 
+/** `process.kill(pid, 0)` throws ESRCH: no such process. EPERM, success or any other error mean "unknown". */
+function isGone(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
+// LEGACY (previous version: `<id>.sock` + `<id>.json`); remove this block in the next version.
+const LEGACY_SOCKET = /^([0-9a-f]{8})\.sock$/;
+
+function removeLegacyJson(busDir: string, id: string): void {
+  const path = join(busDir, `${id}.json`);
+  try {
+    if (lstatSync(path).isFile()) unlinkSync(path);
+  } catch {
+    /* missing or not removable */
+  }
+}
+
+/** Hello-probe old-format sockets in busDir; stale ones go away together with their .json. Live ones stay untouched. */
+async function pruneLegacy(busDir: string, timeoutMs: number): Promise<void> {
+  let names: string[];
+  try {
+    names = readdirSync(busDir);
+  } catch {
+    return;
+  }
+  await Promise.all(
+    names.map(async (name) => {
+      const m = LEGACY_SOCKET.exec(name);
+      if (!m) return;
+      const path = join(busDir, name);
+      try {
+        if (!lstatSync(path).isSocket()) return;
+        await helloProbe(path, timeoutMs);
+      } catch (err) {
+        if (isStaleError(err)) {
+          removeSocket(path);
+          removeLegacyJson(busDir, m[1] as string);
+        }
+      }
+    }),
+  );
+}
+// END LEGACY
+
 /**
- * Probe every registry entry except `selfId` with hello, in parallel. Returns the peers that
- * answered (oldest first). Dead entries (ENOENT/ECONNREFUSED) are pruned; slow, rejecting
- * or mismatching peers are skipped but never pruned.
+ * Probe every socket in the bus dir (and fallback dir) except `selfId`'s with hello, in
+ * parallel. Returns the peers that answered (oldest socket first). A socket is removed only
+ * when its pid is gone (ESRCH) or the hello connect fails with ENOENT/ECONNREFUSED; slow,
+ * rejecting or mismatching peers (hello id/pid differ from the file name) are skipped, never removed.
  */
 export async function listPeers(busDir: string, selfId: string | undefined, options: ListPeersOptions = {}): Promise<PeerRecord[]> {
   const timeout = options.helloTimeoutMs ?? HELLO_TIMEOUT_MS;
   const prune = options.prune ?? true;
-  const entries = listEntries(busDir).filter((e) => e.id !== selfId);
-  const results = await Promise.all(
-    entries.map(async (entry): Promise<PeerRecord | undefined> => {
-      try {
-        const peer = await helloProbe(entry.socket, timeout);
-        if (peer.id !== entry.id) return undefined;
-        return { ...peer, socket: entry.socket, startedAt: entry.startedAt };
-      } catch (err) {
-        if (prune && isStaleError(err)) {
-          // Re-read first: a new process may have taken over this id since we listed it.
-          const current = readEntry(busDir, entry.id);
-          if (current && current.pid === entry.pid && current.startedAt === entry.startedAt) removeEntry(busDir, entry);
+  const entries = listSockets(busDir, options.socketPath).filter((e) => e.id !== selfId);
+  const [results] = await Promise.all([
+    Promise.all(
+      entries.map(async (entry): Promise<PeerRecord | undefined> => {
+        if (isGone(entry.pid)) {
+          if (prune) removeSocket(entry.path);
+          return undefined;
         }
-        return undefined;
-      }
-    }),
-  );
-  return results.filter((r): r is PeerRecord => r !== undefined);
+        try {
+          const peer = await helloProbe(entry.path, timeout);
+          if (peer.id !== entry.id || peer.pid !== entry.pid) return undefined;
+          return { ...peer, socket: entry.path, startedAt: new Date(entry.mtimeMs).toISOString() };
+        } catch (err) {
+          if (prune && isStaleError(err)) removeSocket(entry.path);
+          return undefined;
+        }
+      }),
+    ),
+    prune ? pruneLegacy(busDir, timeout) : undefined, // LEGACY: remove in the next version
+  ]);
+  return results
+    .filter((r): r is PeerRecord => r !== undefined)
+    .sort((a, b) => (a.startedAt === b.startedAt ? a.id.localeCompare(b.id) : a.startedAt.localeCompare(b.startedAt)));
 }
 
 // ---------------------------------------------------------------------------
@@ -254,14 +312,25 @@ export interface EndpointOptions {
   now?: () => number;
 }
 
+/** What a running endpoint is: the socket file `<id>-<pid>.sock` is its only registration. */
+export interface EndpointInfo {
+  id: string;
+  sessionId: string;
+  pid: number;
+  /** Absolute path of the Unix socket. */
+  socket: string;
+  /** ISO timestamp of the start (peers see the socket's mtime instead). */
+  startedAt: string;
+}
+
 export interface Endpoint {
   /** Current id (may change during start() when a live endpoint holds the first choice). */
   readonly id: string;
   readonly socketPath: string | undefined;
   readonly running: boolean;
-  /** Registry entry of the running endpoint. */
-  readonly entry: RegistryEntry | undefined;
-  start(): Promise<RegistryEntry>;
+  /** Info of the running endpoint. */
+  readonly info: EndpointInfo | undefined;
+  start(): Promise<EndpointInfo>;
   stop(): Promise<void>;
 }
 
@@ -271,14 +340,6 @@ interface Conn {
   socket: Socket;
   state: ConnState;
   timer: NodeJS.Timeout | undefined;
-}
-
-function unlinkQuiet(path: string): void {
-  try {
-    unlinkSync(path);
-  } catch {
-    /* already gone */
-  }
 }
 
 type ListenResult = { ok: true; server: Server } | { ok: false; inUse: true };
@@ -297,11 +358,12 @@ export function createEndpoint(options: EndpointOptions): Endpoint {
 
   let id = options.id ?? deriveId(options.sessionId, pid);
   let socketPath: string | undefined;
-  let entry: RegistryEntry | undefined;
+  let ownSocket: string | undefined; // set once we are bound: the only file we ever unlink
+  let info: EndpointInfo | undefined;
   let server: Server | undefined;
   let state: "new" | "starting" | "running" | "stopped" = "new";
   let stopRequested = false;
-  let startPromise: Promise<RegistryEntry> | undefined;
+  let startPromise: Promise<EndpointInfo> | undefined;
   let stopPromise: Promise<void> | undefined;
   let exitListener: (() => void) | undefined;
   const conns = new Set<Conn>();
@@ -463,25 +525,34 @@ export function createEndpoint(options: EndpointOptions): Endpoint {
     }
   }
 
-  function removeOwnFiles(): void {
-    if (!entry || !socketPath) return;
-    const current = readEntry(busDir, entry.id);
-    // Do not delete files a newer endpoint with the same id wrote after us.
-    if (current && (current.pid !== entry.pid || current.startedAt !== entry.startedAt)) return;
-    removeEntry(busDir, { id: entry.id, socket: socketPath });
+  /** Unlink our own socket (only a socket we bound; never other file types). */
+  function removeOwnSocket(): void {
+    if (ownSocket) removeSocket(ownSocket);
   }
 
-  async function doStart(): Promise<RegistryEntry> {
+  /** Light sweep after start: drop sockets of other processes that no longer exist. Never connects. */
+  function sweepDead(): void {
+    try {
+      for (const e of listSockets(busDir, options.socketPath)) {
+        if (e.path === ownSocket) continue;
+        if (isGone(e.pid)) removeSocket(e.path);
+      }
+    } catch {
+      /* best effort */
+    }
+  }
+
+  async function doStart(): Promise<EndpointInfo> {
     ensurePrivateDir(busDir);
     let salt = 0;
     let listening: Server | undefined;
     for (let attempt = 0; attempt < maxStartAttempts && !listening; attempt++) {
       id = salt === 0 ? (options.id ?? deriveId(options.sessionId, pid)) : deriveId(options.sessionId, pid, salt);
-      const path = prepareSocketPath(busDir, id, options.socketPath);
+      const path = prepareSocketPath(busDir, id, pid, options.socketPath);
       socketPath = path;
       let result = await listenOn(path);
       if (!result.ok && (await isStaleSocket(path))) {
-        unlinkQuiet(path);
+        removeSocket(path); // sockets only: a regular file at this path is never removed (the retry then salts the id)
         result = await listenOn(path);
       }
       if (result.ok) listening = result.server;
@@ -491,31 +562,24 @@ export function createEndpoint(options: EndpointOptions): Endpoint {
       throw new Error(`could not bind a session-bus socket in ${busDir} after ${maxStartAttempts} attempts`);
     }
     server = listening;
+    ownSocket = socketPath;
     server.unref();
     try {
       chmodSync(socketPath, 0o600);
-      const written: RegistryEntry = {
-        v: 1,
-        id,
-        sessionId: options.sessionId,
-        pid,
-        socket: socketPath,
-        startedAt: new Date(now()).toISOString(),
-      };
-      writeEntry(busDir, written);
-      entry = written;
     } catch (err) {
       await doStop();
       throw err;
     }
-    exitListener = () => removeOwnFiles();
+    info = { id, sessionId: options.sessionId, pid, socket: socketPath, startedAt: new Date(now()).toISOString() };
+    exitListener = () => removeOwnSocket();
     process.on("exit", exitListener);
     if (stopRequested) {
       await doStop();
       throw new Error("session-bus endpoint was stopped while starting");
     }
     state = "running";
-    return entry;
+    sweepDead();
+    return info;
   }
 
   // -- stop ----------------------------------------------------------------
@@ -530,7 +594,7 @@ export function createEndpoint(options: EndpointOptions): Endpoint {
       if (conn.state === "processing") respond(conn, rejected("shutting down"), true);
       else conn.socket.destroy();
     }
-    removeOwnFiles(); // registry entry first, so nobody lists a peer without a socket
+    removeOwnSocket(); // first, so nobody lists a peer whose server is closing
     const srv = server;
     stopPromise = new Promise<void>((resolve) => {
       if (!srv || !srv.listening) {
@@ -539,7 +603,7 @@ export function createEndpoint(options: EndpointOptions): Endpoint {
       }
       srv.close(() => resolve());
     }).then(() => {
-      if (socketPath) unlinkQuiet(socketPath);
+      removeOwnSocket();
     });
     return stopPromise;
   }
@@ -554,10 +618,10 @@ export function createEndpoint(options: EndpointOptions): Endpoint {
     get running() {
       return state === "running";
     },
-    get entry() {
-      return state === "running" ? entry : undefined;
+    get info() {
+      return state === "running" ? info : undefined;
     },
-    start(): Promise<RegistryEntry> {
+    start(): Promise<EndpointInfo> {
       if (state !== "new") return Promise.reject(new Error(`session-bus endpoint already ${state}`));
       state = "starting";
       startPromise = doStart().catch((err) => {
