@@ -1,0 +1,25 @@
+{
+  "name": "pi-session-bus",
+  "version": "0.1.0",
+  "description": "Let separate local Pi sessions exchange messages over Unix sockets and wake each other",
+  "type": "module",
+  "keywords": ["pi-package", "pi-extension"],
+  "files": ["src", "README.md"],
+  "pi": { "extensions": ["./src/index.ts"] },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test 'test/**/*.test.ts'"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.0.0",
+    "@earendil-works/pi-ai": "1.0.0",
+    "typebox": "1.3.27",
+    "@types/node": "^22.19.19",
+    "typescript": "^6.0.2"
+  },
+  "engines": { "node": ">=22.19.0" }
+}
