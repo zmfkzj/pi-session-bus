@@ -15,3 +15,4 @@ export * from "./policy.ts";
 export * from "./protocol.ts";
 export * from "./registry.ts";
 export * from "./resolve.ts";
+export * from "./queue.ts";

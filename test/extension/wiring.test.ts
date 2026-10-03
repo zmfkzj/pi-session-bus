@@ -78,9 +78,10 @@ function noteTo(entry: SocketEntry, over: { hops?: number; wake?: boolean; conte
 }
 
 describe("registration", () => {
-  it("registers both tools and /bus, and starts nothing in the factory", async () => {
+  it("registers three tools and /bus plus /queue, and starts nothing in the factory", async () => {
     const host = makeHost();
-    assert.deepEqual([...host.tools.keys()].sort(), ["session_list", "session_send"]);
+    assert.deepEqual([...host.tools.keys()].sort(), ["queue_done", "session_list", "session_send"]);
+    assert.ok(host.commands.has("queue"));
     assert.ok(host.commands.has("bus"));
     assert.deepEqual(host.handlers.get("session_start")?.length, 1);
     assert.deepEqual(host.handlers.get("session_shutdown")?.length, 1);
@@ -94,7 +95,7 @@ describe("registration", () => {
     const list = host.tool("session_list");
     const send = host.tool("session_send");
     assert.equal(list.annotations?.readOnlyHint, true);
-    for (const tool of [list, send]) {
+    for (const tool of [list, send, host.tool("queue_done")]) {
       assert.ok(tool.promptSnippet && tool.promptSnippet.length > 0, `${tool.name} promptSnippet`);
       assert.ok((tool.promptGuidelines?.length ?? 0) > 0, `${tool.name} promptGuidelines`);
     }
@@ -108,7 +109,8 @@ describe("registration", () => {
     assert.equal(typeof defaultFactory, "function");
     const host = new FakeHost();
     defaultFactory(host.pi);
-    assert.deepEqual([...host.tools.keys()].sort(), ["session_list", "session_send"]);
+    assert.deepEqual([...host.tools.keys()].sort(), ["queue_done", "session_list", "session_send"]);
+    assert.ok(host.commands.has("queue"));
     assert.ok(host.commands.has("bus"));
   });
 });
@@ -695,7 +697,7 @@ describe("/bus command", () => {
 describe("win32", () => {
   it("registers tools and the command, starts no endpoint, notifies once, and reports 'unsupported'", async () => {
     const host = makeHost({}, { platform: "win32" });
-    assert.deepEqual([...host.tools.keys()].sort(), ["session_list", "session_send"]);
+    assert.deepEqual([...host.tools.keys()].sort(), ["queue_done", "session_list", "session_send"]);
     assert.ok(host.commands.has("bus"));
     await host.start();
     await host.start("reload");

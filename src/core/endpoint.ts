@@ -21,7 +21,7 @@
  * CLIENT  helloProbe(socket, timeout) -> PeerInfo
  *         sendNote(socket, note, timeout) -> NoteDelivered
  *         listPeers(busDir, selfId) -> PeerRecord[]   (hello-probes every socket except selfId's)
- *   Failures are BusClientError with code unreachable | rejected | timeout | too_large.
+ *   Failures are BusClientError with code unreachable | rejected | timeout | too_large | cancelled.
  *   `errno` carries the socket error code (e.g. ENOENT/ECONNREFUSED). Only those two
  *   (see isStaleError) and a vanished pid (ESRCH) make listPeers remove a socket; a timeout, a
  *   rejection or a hello answer whose id/pid differs from the file name never does.
@@ -41,9 +41,13 @@ import {
   PROTOCOL_VERSION,
   parseHelloResponse,
   parseNoteResponse,
+  parseQueueNudgeResponse,
+  type QueueNudgeAccepted,
+  type QueueNudgeResponse,
   parseRequest,
   rejected,
   createHelloRequest,
+  capSessionName,
   type HelloResponse,
   type NoteDelivered,
   type NoteRequest,
@@ -63,7 +67,7 @@ import {
 // Client
 // ---------------------------------------------------------------------------
 
-export type BusClientErrorCode = "unreachable" | "rejected" | "timeout" | "too_large";
+export type BusClientErrorCode = "unreachable" | "rejected" | "timeout" | "too_large" | "cancelled";
 
 export class BusClientError extends Error {
   readonly code: BusClientErrorCode;
@@ -71,13 +75,16 @@ export class BusClientError extends Error {
   readonly reason: string | undefined;
   /** Socket error code such as ENOENT / ECONNREFUSED (code "unreachable"). */
   readonly errno: string | undefined;
+  /** Cancellation happened after the frame may have been written. */
+  readonly deliveryUnconfirmed: boolean;
 
-  constructor(code: BusClientErrorCode, message: string, extra: { reason?: string; errno?: string } = {}) {
+  constructor(code: BusClientErrorCode, message: string, extra: { reason?: string; errno?: string; deliveryUnconfirmed?: boolean } = {}) {
     super(message);
     this.name = "BusClientError";
     this.code = code;
     this.reason = extra.reason;
     this.errno = extra.errno;
+    this.deliveryUnconfirmed = extra.deliveryUnconfirmed ?? false;
   }
 }
 
@@ -91,19 +98,32 @@ export function isStaleError(err: unknown): boolean {
 }
 
 /** Send one frame and resolve with the first response frame (as text). */
-function exchange(socketPath: string, frame: Buffer, timeoutMs: number): Promise<string> {
+function exchange(socketPath: string, frame: Buffer, timeoutMs: number, signal?: AbortSignal): Promise<string> {
   return new Promise<string>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new BusClientError("cancelled", "cancelled before sending."));
+      return;
+    }
     let settled = false;
+    let frameMayHaveBeenWritten = false;
     const decoder = new FrameDecoder(MAX_FRAME_BYTES);
     const sock = createConnection(socketPath);
     const finish = (err: BusClientError | undefined, value?: string): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
       sock.destroy();
       if (err) reject(err);
       else resolve(value as string);
     };
+    const onAbort = (): void => finish(new BusClientError(
+      "cancelled",
+      frameMayHaveBeenWritten
+        ? "send cancelled; delivery is unconfirmed (it may or may not have arrived). Do not resend blindly."
+        : "cancelled before sending.",
+      { deliveryUnconfirmed: frameMayHaveBeenWritten },
+    ));
     const timer = setTimeout(
       () => finish(new BusClientError("timeout", `no response from ${socketPath} within ${timeoutMs} ms`)),
       timeoutMs,
@@ -118,7 +138,14 @@ function exchange(socketPath: string, frame: Buffer, timeoutMs: number): Promise
       else if (result.error) finish(new BusClientError("rejected", `invalid response from peer (${result.error})`));
     });
     sock.on("close", () => finish(new BusClientError("unreachable", "connection closed without a response")));
-    sock.write(frame);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+    sock.once("connect", () => {
+      if (settled) return;
+      if (signal?.aborted) { onAbort(); return; }
+      frameMayHaveBeenWritten = true;
+      sock.write(frame);
+    });
   });
 }
 
@@ -140,6 +167,7 @@ export async function helloProbe(socketPath: string, timeoutMs: number = HELLO_T
 export interface SendNoteOptions {
   maxContentBytes?: number;
   maxFrameBytes?: number;
+  signal?: AbortSignal;
 }
 
 /**
@@ -164,7 +192,7 @@ export async function sendNote(
   } catch (err) {
     throw new BusClientError("too_large", `message does not fit in one frame: ${(err as Error).message}`);
   }
-  const text = await exchange(socketPath, frame, timeoutMs);
+  const text = await exchange(socketPath, frame, timeoutMs, options.signal);
   const parsed = parseNoteResponse(parseJson(text));
   if (!parsed.ok) {
     throw new BusClientError("rejected", `invalid response from peer: ${parsed.reason}`, { reason: parsed.reason });
@@ -172,6 +200,21 @@ export async function sendNote(
   const res = parsed.value;
   if (!res.ok) throw new BusClientError("rejected", `peer rejected the note: ${res.reason}`, { reason: res.reason });
   return res;
+}
+
+/** Content-free advisory nudge; failures retain the same stale-error classification as hello. */
+export async function sendQueueNudge(
+  socketPath: string,
+  queue: string,
+  timeoutMs: number = HELLO_TIMEOUT_MS,
+): Promise<QueueNudgeAccepted> {
+  const request = { v: PROTOCOL_VERSION, type: "queue_nudge", queue };
+  const valid = parseRequest(request);
+  if (!valid.ok) throw new BusClientError("rejected", valid.reason, { reason: valid.reason });
+  const parsed = parseQueueNudgeResponse(parseJson(await exchange(socketPath, encodeFrame(request), timeoutMs)));
+  if (!parsed.ok) throw new BusClientError("rejected", parsed.reason, { reason: parsed.reason });
+  if (!parsed.value.ok) throw new BusClientError("rejected", parsed.value.reason, { reason: parsed.value.reason });
+  return parsed.value;
 }
 
 /** A live peer as seen through its hello answer, plus where to reach it. */
@@ -189,7 +232,7 @@ export interface ListPeersOptions {
 }
 
 /** `process.kill(pid, 0)` throws ESRCH: no such process. EPERM, success or any other error mean "unknown". */
-function isGone(pid: number): boolean {
+export function isGone(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return false;
@@ -302,6 +345,8 @@ export interface EndpointOptions {
   getPeerInfo: () => LivePeerInfo;
   /** Handle a validated, deduplicated note addressed to this endpoint. */
   onNote: (note: NoteRequest) => NoteResponse | Promise<NoteResponse>;
+  /** Content-free queue notification. Acknowledged before the callback is scheduled. */
+  onQueueNudge?: (queue: string) => void | Promise<void>;
   limits?: EndpointLimits;
   /** Socket path fallback inputs (env, tmpdir, uid, maxBytes). */
   socketPath?: SocketPathOptions;
@@ -377,7 +422,7 @@ export function createEndpoint(options: EndpointOptions): Endpoint {
   }
 
   /** Send the single response and close our side; a stalled peer is dropped after idleTimeoutMs. */
-  function respond(conn: Conn, response: HelloResponse | NoteResponse, destroyWhenFlushed = false): void {
+  function respond(conn: Conn, response: HelloResponse | NoteResponse | QueueNudgeResponse, destroyWhenFlushed = false): void {
     if (conn.state === "done") return;
     conn.state = "done";
     clearConnTimer(conn);
@@ -455,8 +500,20 @@ export function createEndpoint(options: EndpointOptions): Endpoint {
           autoWake: live.autoWake,
           receiving: true,
         };
-        if (live.name !== undefined) peer.name = live.name.slice(0, 256);
+        if (live.name !== undefined) peer.name = capSessionName(live.name);
         respond(conn, { v: PROTOCOL_VERSION, ok: true, peer });
+        return;
+      }
+      if (req.type === "queue_nudge") {
+        if (!options.onQueueNudge) {
+          respond(conn, rejected("queue nudges are not supported"));
+          return;
+        }
+        respond(conn, { v: PROTOCOL_VERSION, ok: true, status: "accepted" });
+        setImmediate(() => {
+          if (stopRequested) return;
+          void Promise.resolve().then(() => options.onQueueNudge?.(req.queue)).catch(() => {});
+        });
         return;
       }
       respond(conn, await handleNote(req));

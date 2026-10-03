@@ -1,6 +1,6 @@
 /**
  * Bus directory, ids and socket files (POSIX, synchronous fs calls). The socket directory is
- * the registry: there are no other files.
+ * the endpoint registry; opt-in repository queues use a separate `queue/` subdirectory.
  *
  * Layout
  *   <busDir>/<id>-<pid>.sock   Unix socket, mode 0600; <id> = 8 lowercase hex chars (deriveId),

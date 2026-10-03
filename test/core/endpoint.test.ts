@@ -21,6 +21,7 @@ import {
   isStaleError,
   listPeers,
   sendNote,
+  sendQueueNudge,
   type Endpoint,
   type EndpointOptions,
   type LivePeerInfo,
@@ -933,5 +934,45 @@ describe("long socket paths", () => {
     const peers = await listPeers(longBus, undefined, { socketPath });
     assert.deepEqual(peers.map((p) => p.id).sort(), [first.id, second.id].sort());
     assert.equal(existsSync(pruned.path), false);
+  });
+});
+
+describe("queue nudge endpoint", () => {
+  it("accepts and dispatches content-free nudges through sendQueueNudge", async () => {
+    const keys: string[] = [];
+    const { endpoint, notes } = makeEndpoint({ onQueueNudge: (key) => { keys.push(key); } });
+    const info = await endpoint.start();
+    assert.deepEqual(await sendQueueNudge(info.socket, "0123456789abcdef"), { v: 1, ok: true, status: "accepted" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(keys, ["0123456789abcdef"]);
+    assert.deepEqual(notes, []);
+  });
+  it("rejects nudges when the endpoint does not support them", async () => {
+    const { endpoint } = makeEndpoint();
+    const info = await endpoint.start();
+    await assert.rejects(sendQueueNudge(info.socket, "0123456789abcdef"), (err: unknown) =>
+      err instanceof BusClientError && err.code === "rejected" && !isStaleError(err));
+  });
+  it("rejects malformed queue keys without dispatching them", async () => {
+    const keys: string[] = [];
+    const { endpoint } = makeEndpoint({ onQueueNudge: (key) => { keys.push(key); } });
+    const info = await endpoint.start();
+    const result = await rawExchange(info.socket, encodeFrame({ v: 1, type: "queue_nudge", queue: "../escape" }));
+    assert.equal(JSON.parse(result.received).ok, false);
+    assert.deepEqual(keys, []);
+    await assert.rejects(sendQueueNudge(info.socket, "bad"), BusClientError);
+  });
+  it("acknowledges before an asynchronous handler finishes and contains callback errors", async () => {
+    let resolveHandler!: () => void;
+    const pending = new Promise<void>((resolve) => { resolveHandler = resolve; });
+    const { endpoint } = makeEndpoint({ onQueueNudge: () => pending });
+    const info = await endpoint.start();
+    assert.equal((await sendQueueNudge(info.socket, "0123456789abcdef", 50)).ok, true);
+    resolveHandler();
+    const throwing = makeEndpoint({ onQueueNudge: () => { throw new Error("test"); } }, "throwing");
+    assert.equal((await sendQueueNudge((await throwing.endpoint.start()).socket, "0123456789abcdef")).ok, true);
+  });
+  it("preserves stale-error classification on nudge socket failures", async () => {
+    await assert.rejects(sendQueueNudge(join(tmp, "missing.sock"), "0123456789abcdef"), isStaleError);
   });
 });

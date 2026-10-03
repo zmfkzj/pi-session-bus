@@ -53,8 +53,11 @@ export class FakeHost {
   readonly tools = new Map<string, FakeTool>();
   readonly commands = new Map<string, FakeCommand>();
   readonly sent: SentMessage[] = [];
+  readonly userMessages: { content: string | unknown[]; options?: Record<string, unknown> }[] = [];
+  editorText = "";
   readonly notifications: Notification[] = [];
   readonly statuses: (string | undefined)[] = [];
+  readonly queueStatuses: (string | undefined)[] = [];
   readonly callsAfterDeath: string[] = [];
   idle = true;
   sessionName: string | undefined;
@@ -90,6 +93,10 @@ export class FakeHost {
         guard("pi.sendMessage");
         this.sent.push({ message, options });
       },
+      sendUserMessage: (content: string | unknown[], options?: Record<string, unknown>) => {
+        guard("pi.sendUserMessage");
+        this.userMessages.push({ content, ...(options ? { options } : {}) });
+      },
       getSessionName: () => {
         guard("pi.getSessionName");
         return this.sessionName;
@@ -118,8 +125,10 @@ export class FakeHost {
         },
         setStatus: (_key: string, text: string | undefined) => {
           guard("ctx.ui.setStatus");
-          this.statuses.push(text);
+          (_key === "session-bus-queue" ? this.queueStatuses : this.statuses).push(text);
         },
+        getEditorText: () => { guard("ctx.ui.getEditorText"); return this.editorText; },
+        setEditorText: (text: string) => { guard("ctx.ui.setEditorText"); this.editorText = text; },
       },
     };
     Object.defineProperty(ctx, "cwd", {
@@ -132,8 +141,13 @@ export class FakeHost {
     this.ctx = ctx as unknown as ExtensionContext;
   }
 
-  async fire(event: string, payload: Record<string, unknown> = {}): Promise<void> {
-    for (const handler of this.handlers.get(event) ?? []) await handler({ type: event, ...payload }, this.ctx);
+  async fire(event: string, payload: Record<string, unknown> = {}): Promise<unknown> {
+    let result: unknown;
+    for (const handler of this.handlers.get(event) ?? []) {
+      const value = await handler({ type: event, ...payload }, this.ctx);
+      if (value !== undefined) result = value;
+    }
+    return result;
   }
 
   async start(reason = "startup"): Promise<void> {
@@ -156,9 +170,9 @@ export class FakeHost {
     return this.tool(name).execute("call-1", params, undefined, undefined, this.ctx);
   }
 
-  runCommand(args: string): Promise<void> {
-    const command = this.commands.get("bus");
-    if (!command) throw new Error("/bus is not registered");
+  runCommand(args: string, name = "bus"): Promise<void> {
+    const command = this.commands.get(name);
+    if (!command) throw new Error(`/${name} is not registered`);
     return command.handler(args, this.ctx);
   }
 

@@ -5,6 +5,7 @@
  */
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -26,7 +27,7 @@ import {
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { deriveId, listSockets, socketFileName } from "../../src/core/index.ts";
+import { createQueueStore, deriveId, listSockets, socketFileName } from "../../src/core/index.ts";
 import { createSessionBusExtension, type SessionBusOptions } from "../../src/index.ts";
 import { makeTempDir, removeTempDir } from "../core/helpers.ts";
 
@@ -84,7 +85,12 @@ afterEach(async () => {
     node.session.dispose();
   }
   assert.deepEqual(listSockets(busDir), [], "every endpoint must remove its socket on shutdown");
-  assert.deepEqual(existsSync(busDir) ? readdirSync(busDir) : [], [], "and nothing else is left in the bus dir");
+  assert.deepEqual(existsSync(busDir) ? readdirSync(busDir).filter(name => name !== "queue") : [], [], "no sockets or unrelated files remain");
+  const sharedRepo = join(tmp, "shared-repo");
+  if (existsSync(join(busDir, "queue"))) {
+    assert.equal(createQueueStore({ busDir, repo: sharedRepo }).read().entries.length, 0, "shutdown removes every queue entry");
+    assert.ok(readdirSync(join(busDir, "queue")).every(name => name.endsWith(".json")), "no locks or temporary files remain");
+  }
   removeTempDir(tmp);
 });
 
@@ -92,8 +98,9 @@ async function makeNode(
   name: string,
   extensionOptions: SessionBusOptions = {},
   customTools: ReturnType<typeof defineTool>[] = [],
+  cwdOverride?: string,
 ): Promise<Node> {
-  const cwd = join(tmp, `cwd-${name}`);
+  const cwd = cwdOverride ?? join(tmp, `cwd-${name}`);
   const agentDir = join(tmp, `agent-${name}`);
   mkdirSync(cwd, { recursive: true });
   mkdirSync(agentDir, { recursive: true });
@@ -386,4 +393,57 @@ describe("two real Pi sessions on one bus", () => {
     assert.ok(send?.isError, "sending to a vanished session is a tool error");
     assert.match(textOf(send), /no live session matches/);
   });
+
+  it("repository queue: A's queue_done releases at settle, B's own deferred prompt runs in B and its model sees the turn notice", async () => {
+    const repo = join(tmp, "shared-repo");
+    mkdirSync(repo); execFileSync("git", ["init", "--quiet", repo]);
+    const a = await makeNode("alpha", { queuePollMs: 20 }, [], repo);
+    const b = await makeNode("beta", { queuePollMs: 60_000 }, [], repo);
+    const finish = deferred();
+    a.script([async () => { await finish.promise; return call("queue_done", {}); }, () => say("A's task is complete.")]);
+    b.script([() => say("B has completed its own task.")]);
+    await a.session.prompt("/queue implement A's change");
+    await waitFor(() => a.requests.length === 1, "A to hold and run");
+    await b.session.prompt("/queue on");
+    await b.session.prompt("implement B's independent change");
+    assert.equal(b.requests.length, 0, "B's user input is handled without running the model");
+    const file = createQueueStore({ busDir, repo }).read();
+    assert.deepEqual(file.entries.map(e => e.state), ["active", "waiting"]);
+    assert.deepEqual(file.entries.map(e => e.endpointId), [a.id(), b.id()]);
+    finish.resolve();
+    await a.session.waitForIdle();
+    await waitFor(() => b.requests.length === 1, "B's deferred user prompt to run after handoff");
+    await b.session.waitForIdle();
+    assert.match(textOf(toolResults(a, "queue_done")[0]!), /when this run ends/);
+    assert.ok(b.requests[0]!.includes("implement B's independent change"));
+    assert.ok(!b.requests[0]!.includes("implement A's change"), "the deferred task belongs to B, not A");
+    assert.ok((b.session.messages as unknown as { role: string; customType?: string }[]).some(m => m.role === "custom" && m.customType === "session-bus.queue-turn"), "the turn notice is a separate extension-authored message");
+    assert.ok(b.requests[0]!.includes(`holds the repository work-queue turn for ${repo}`));
+    assert.ok(b.requests[0]!.includes("Call queue_done"));
+    assert.ok(b.requests[0]!.includes("not asking or waiting for the user's reply"));
+    assert.equal(b.runs, 1);
+  });
+
+  it("repository queue: multiple deferred prompts replay in order as real streaming follow-ups", async () => {
+    const repo = join(tmp, "shared-repo");
+    mkdirSync(repo); execFileSync("git", ["init", "--quiet", repo]);
+    const a = await makeNode("alpha", {}, [], repo);
+    const b = await makeNode("beta", { queuePollMs: 60_000 }, [], repo);
+    a.script([() => say("Please give me the next part of the task.")]);
+    b.script([() => say("First done."), () => say("Second done."), () => say("Third done.")]);
+    await a.session.prompt("/queue hold A's task");
+    await waitFor(() => a.requests.length === 1, "A to start"); await a.session.waitForIdle();
+    await b.session.prompt("/queue on");
+    for (const text of ["first deferred task", "second deferred task", "third deferred task"]) await b.session.prompt(text);
+    assert.equal(b.requests.length, 0);
+    await a.session.prompt("/queue done");
+    await waitFor(() => b.requests.length === 3, "all three deferred prompts to run");
+    await b.session.waitForIdle();
+    assert.ok(b.requests[0]!.includes("first deferred task"));
+    assert.ok(!b.requests[0]!.includes("second deferred task"));
+    assert.ok(b.requests[1]!.includes("second deferred task"));
+    assert.ok(!b.requests[1]!.includes("third deferred task"));
+    assert.ok(b.requests[2]!.includes("third deferred task"));
+  });
+
 });

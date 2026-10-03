@@ -9,6 +9,7 @@ import {
   MAX_FRAME_BYTES,
   parseHelloResponse,
   parseNoteResponse,
+  parseQueueNudgeResponse,
   parseRequest,
   PROTOCOL_VERSION,
   rejected,
@@ -296,5 +297,26 @@ describe("formatNoteText", () => {
     assert.ok(lines[0]!.startsWith("[session-bus message · from "));
     assert.ok(!lines[0]!.includes("\u2028"));
     assert.ok(!lines[0]!.includes('evil"'));
+  });
+});
+
+describe("queue nudge protocol", () => {
+  it("parses a content-free nudge and drops extra fields", () => {
+    assert.deepEqual(parseRequest({ v: 1, type: "queue_nudge", queue: "0123456789abcdef", content: "ignored" }),
+      { ok: true, value: { v: 1, type: "queue_nudge", queue: "0123456789abcdef" } });
+  });
+  it("rejects malformed nudge keys and unsupported protocol versions", () => {
+    for (const queue of [undefined, null, 1, "", "0123456789abcde", "0123456789abcdef0", "0123456789abcdeF", "../escape"]) {
+      assert.equal(parseRequest({ v: 1, type: "queue_nudge", queue }).ok, false);
+    }
+    assert.equal(parseRequest({ v: 2, type: "queue_nudge", queue: "0123456789abcdef" }).ok, false);
+  });
+  it("parses accepted and rejected nudge responses but rejects malformed responses", () => {
+    const accepted = { v: 1, ok: true, status: "accepted" };
+    assert.deepEqual(parseQueueNudgeResponse(accepted), { ok: true, value: accepted });
+    const denied = rejected("unsupported");
+    assert.deepEqual(parseQueueNudgeResponse(denied), { ok: true, value: denied });
+    for (const response of [null, { v: 1, ok: true, status: "delivered" }, { v: 2, ok: true, status: "accepted" },
+      { v: 1, ok: false, status: "rejected" }]) assert.equal(parseQueueNudgeResponse(response).ok, false);
   });
 });

@@ -8,10 +8,12 @@
  * Requests
  *   hello  {v:1,type:"hello"}
  *   note   {v:1,type:"note",id,from,to,content,hops,wake,replyTo?,sentAt}
+ *   queue_nudge {v:1,type:"queue_nudge",queue:<16 hex>} (content-free advisory re-check)
  *
  * Responses
  *   hello  {v:1,ok:true,peer:PeerInfo}
  *   note   {v:1,ok:true,status:"delivered"|"duplicate",wake:"started"|"queued"|"suppressed",reason?}
+ *   queue_nudge {v:1,ok:true,status:"accepted"}
  *          {v:1,ok:false,status:"rejected",reason}
  *   any request that fails validation is answered with the rejected shape.
  *
@@ -95,7 +97,20 @@ export interface NoteRequest {
   sentAt: string;
 }
 
-export type Request = HelloRequest | NoteRequest;
+export interface QueueNudgeRequest {
+  v: 1;
+  type: "queue_nudge";
+  queue: string;
+}
+
+export interface QueueNudgeAccepted {
+  v: 1;
+  ok: true;
+  status: "accepted";
+}
+
+export type QueueNudgeResponse = QueueNudgeAccepted | NoteRejected;
+export type Request = HelloRequest | NoteRequest | QueueNudgeRequest;
 
 export interface NoteDelivered {
   v: 1;
@@ -199,6 +214,16 @@ const MAX_NAME_CHARS = 256;
 const MAX_CWD_CHARS = 4096;
 const MAX_HOPS_WIRE = 1_000_000;
 const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/;
+
+/** Cap advertised names to the parser's UTF-16 code-unit limit without splitting a surrogate pair. */
+export function capSessionName(name: string): string {
+  if (name.length <= MAX_NAME_CHARS) return name;
+  let end = MAX_NAME_CHARS;
+  const last = name.charCodeAt(end - 1);
+  const next = name.charCodeAt(end);
+  if (last >= 0xd800 && last <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end--;
+  return name.slice(0, end);
+}
 
 class Invalid extends Error {}
 
@@ -305,6 +330,11 @@ export function parseRequest(value: unknown, limits: ValidationLimits = {}): Par
     const o = readRecord(value, "request");
     readVersion(o);
     if (o.type === "hello") return { v: PROTOCOL_VERSION, type: "hello" };
+    if (o.type === "queue_nudge") {
+      const queue = readString(o, "queue", "queue_nudge", 16);
+      need(/^[0-9a-f]{16}$/.test(queue), "queue_nudge.queue must be 16 lowercase hex characters");
+      return { v: PROTOCOL_VERSION, type: "queue_nudge", queue };
+    }
     need(o.type === "note", `unsupported request type ${show(o.type)}`);
     const content = readString(o, "content", "note", Number.MAX_SAFE_INTEGER);
     need(content.trim().length > 0, "note.content must not be empty");
@@ -360,6 +390,19 @@ export function parseNoteResponse(value: unknown): ParseResult<NoteResponse> {
       res.reason = o.reason as WakeSuppressReason;
     }
     return res;
+  });
+}
+
+export function parseQueueNudgeResponse(value: unknown): ParseResult<QueueNudgeResponse> {
+  return guard(() => {
+    const o = readRecord(value, "response");
+    readVersion(o);
+    if (o.ok === false) {
+      need(o.status === "rejected", "response.status must be 'rejected' when ok is false");
+      return rejected(readString(o, "reason", "response", 1024, true));
+    }
+    need(o.ok === true && o.status === "accepted", "invalid queue_nudge response");
+    return { v: PROTOCOL_VERSION, ok: true, status: "accepted" };
   });
 }
 

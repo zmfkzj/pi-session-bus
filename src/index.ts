@@ -27,6 +27,7 @@ import {
   PROTOCOL_VERSION,
   WakePolicy,
   createEndpoint,
+  capSessionName,
   createNote,
   deriveId,
   ensurePrivateDir,
@@ -45,6 +46,7 @@ import {
   type WakeStatus,
   type WakeSuppressReason,
 } from "./core/index.ts";
+import { createQueueWiring } from "./queue.ts";
 
 /** Run mode of the host: "tui" | "rpc" | "json" | "print". */
 export type SessionBusMode = ExtensionContext["mode"];
@@ -75,6 +77,12 @@ export interface SessionBusOptions {
   now?: () => number;
   /** Injectable platform; "win32" disables the bus. */
   platform?: NodeJS.Platform;
+  /** Repository turn idle grace (default 600000 ms). */
+  queueIdleMs?: number;
+  /** Repository queue polling interval (default 5000 ms). */
+  queuePollMs?: number;
+  /** Injectable git toplevel resolver; default git rev-parse then realpath. */
+  gitToplevel?: (cwd: string) => Promise<string> | string;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +176,21 @@ export function createSessionBusExtension(options: SessionBusOptions = {}): (pi:
     const notified = new Set<string>();
 
     const busDir = (): string => options.busDir ?? resolveBusDir({ getAgentDir });
+    const queue = createQueueWiring(pi, {
+      busDir,
+      context: () => active ? ctx : undefined,
+      identity: () => {
+        if (!active || !ctx || !endpoint?.running) return undefined;
+        const name = advertisedName();
+        return { endpointId: endpoint.id, sessionId: ctx.sessionManager.getSessionId(), ...(name ? { name } : {}) };
+      },
+      available: () => !supported ? UNSUPPORTED : !endpoint?.running ? "requires a running bus endpoint in TUI or RPC mode" : undefined,
+      resetChain: () => policy.resetChain(),
+      now,
+      ...(options.queueIdleMs === undefined ? {} : { idleMs: options.queueIdleMs }),
+      ...(options.queuePollMs === undefined ? {} : { pollMs: options.queuePollMs }),
+      ...(options.gitToplevel === undefined ? {} : { gitToplevel: options.gitToplevel }),
+    });
 
     function notifyOnce(key: string, message: string, level: "info" | "warning" | "error"): void {
       if (notified.has(key) || !active || !ctx) return;
@@ -192,11 +215,16 @@ export function createSessionBusExtension(options: SessionBusOptions = {}): (pi:
 
     // -- identity ------------------------------------------------------------
 
+    function advertisedName(): string | undefined {
+      const name = pi.getSessionName();
+      return name ? capSessionName(name) : undefined;
+    }
+
     function selfInfo(c: ExtensionContext): SelfInfo {
       const sessionId = c.sessionManager.getSessionId();
       const ep = endpoint;
       const receiving = ep?.running === true;
-      const name = pi.getSessionName();
+      const name = advertisedName();
       return {
         id: receiving && ep ? ep.id : deriveId(sessionId, process.pid),
         sessionId,
@@ -259,7 +287,7 @@ export function createSessionBusExtension(options: SessionBusOptions = {}): (pi:
       try {
         info.cwd = lastCwd = c.cwd;
         info.busy = !c.isIdle();
-        const name = pi.getSessionName();
+        const name = advertisedName();
         if (name !== undefined && name.length > 0) info.name = name;
       } catch {
         /* stale runtime: answer with what we know */
@@ -302,6 +330,10 @@ export function createSessionBusExtension(options: SessionBusOptions = {}): (pi:
           return `message is too large: ${flat(err.message, 200)}. Shorten it (the limit is ${maxContentBytes} bytes of content).`;
         case "timeout":
           return `session ${who} did not answer within ${noteTimeoutMs} ms; delivery is unconfirmed (it may or may not have arrived). Do not resend blindly.`;
+        case "cancelled":
+          return err.deliveryUnconfirmed
+            ? `send to session ${who} was cancelled; delivery is unconfirmed (it may or may not have arrived). Do not resend blindly.`
+            : "cancelled before sending.";
         case "rejected":
           // err.reason is peer-controlled (up to 1024 chars, control characters allowed): flatten it.
           return `session ${who} rejected the message: ${flat(err.reason ?? err.message, 200)}.`;
@@ -319,6 +351,7 @@ export function createSessionBusExtension(options: SessionBusOptions = {}): (pi:
       }
       if (req.signal?.aborted) throw new Error("cancelled before sending.");
       const { self, peers } = await livePeers(c);
+      if (req.signal?.aborted) throw new Error("cancelled before sending.");
       const resolution = resolveTarget(
         req.to,
         { id: self.receiving ? self.id : "", sessionId: self.sessionId, ...(self.name === undefined ? {} : { name: self.name }) },
@@ -361,6 +394,7 @@ export function createSessionBusExtension(options: SessionBusOptions = {}): (pi:
       try {
         const response = await sendNote(peer.socket, note, noteTimeoutMs, {
           maxContentBytes,
+          signal: req.signal,
           ...(options.limits?.maxFrameBytes === undefined ? {} : { maxFrameBytes: options.limits.maxFrameBytes }),
         });
         return { peer, note, response };
@@ -405,12 +439,14 @@ export function createSessionBusExtension(options: SessionBusOptions = {}): (pi:
     // -- lifecycle -----------------------------------------------------------
 
     pi.on("session_start", async (_event, c) => {
+      await queue.shutdown();
       ctx = c;
       lastCwd = c.cwd;
       active = true;
       // A session_start without a preceding shutdown must not leak the previous endpoint.
       await stopEndpoint();
       if (!active) return; // shut down while we were stopping the previous endpoint
+      queue.start();
       if (!supported) {
         notifyOnce("unsupported", `session-bus: ${UNSUPPORTED}`, "warning");
         return;
@@ -427,6 +463,7 @@ export function createSessionBusExtension(options: SessionBusOptions = {}): (pi:
         sessionId,
         getPeerInfo: peerInfo,
         onNote: handleNote,
+        onQueueNudge: key => queue.onNudge(key),
         ...(options.limits === undefined ? {} : { limits: options.limits }),
         now,
       });
@@ -457,9 +494,11 @@ export function createSessionBusExtension(options: SessionBusOptions = {}): (pi:
       if (!active) return;
       // A human (or an RPC client) started this: a new conversation chain begins.
       if (event.source === "interactive" || event.source === "rpc") policy.resetChain();
+      return queue.input(event);
     });
 
     pi.on("session_shutdown", async () => {
+      await queue.shutdown();
       if (active && ctx && ctx.mode === "tui") {
         try {
           ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -587,7 +626,7 @@ export function createSessionBusExtension(options: SessionBusOptions = {}): (pi:
           const parts = /^(\S+)\s+([\s\S]+)$/.exec(rest);
           if (parts) {
             try {
-              const out = await deliver(c, { to: parts[1]!, content: parts[2]!.trim(), wake: true, hops: 1 });
+              const out = await deliver(c, { to: parts[1]!, content: parts[2]!.trim(), wake: true, hops: 1, signal: c.signal });
               c.ui.notify(
                 `Sent msg ${out.note.id} to ${label(out.peer)} · wake: ${describeWake(out.response.wake, out.response.reason)}.`,
                 "info",
