@@ -3,7 +3,7 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, symlinkSync } from "node
 import { createServer, type Server } from "node:net";
 import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import defaultFactory, { createSessionBusExtension, USAGE, type SessionBusOptions } from "../../src/index.ts";
+import defaultFactory, { createSessionBusExtension, MESSAGE_EVENT, USAGE, type SessionBusOptions } from "../../src/index.ts";
 import {
   BusClientError,
   createNote,
@@ -332,6 +332,37 @@ describe("delivery into the session", () => {
       (err: unknown) => err instanceof BusClientError && err.code === "rejected" && /wrong recipient/.test(err.reason ?? ""),
     );
     assert.deepEqual(host.sent, []);
+  });
+
+  it("announces every accepted note on pi.events (id, wake, sender; no content) right after sendMessage, never a rejected one", async () => {
+    const host = makeHost({}, { maxHops: 4 });
+    await host.start();
+    host.idle = false;
+    const entry = onlyEntry();
+    const pi = host.pi as unknown as { sendMessage: (message: unknown, options?: unknown) => void };
+    const realSendMessage = pi.sendMessage;
+    let sentBeforeEvent = -1;
+    pi.sendMessage = (message, options) => {
+      realSendMessage(message, options);
+      sentBeforeEvent = host.events.length;
+    };
+    const woken = noteTo(entry, { content: "secret body" });
+    assert.equal((await sendNote(entry.path, woken)).wake, "queued");
+    // the steer was handed to pi before the event (a listener sees it queued)
+    assert.equal(sentBeforeEvent, 0);
+    assert.deepEqual(host.events, [{ channel: MESSAGE_EVENT, data: { id: woken.id, wake: "queued", from: { id: "feedc0de", name: "sender" }, hops: 1 } }]);
+    assert.ok(!JSON.stringify(host.events).includes("secret body"));
+    const quiet = noteTo(entry, { hops: 5 });
+    assert.equal((await sendNote(entry.path, quiet)).wake, "suppressed");
+    assert.deepEqual(host.events[1], { channel: MESSAGE_EVENT, data: { id: quiet.id, wake: "suppressed", from: { id: "feedc0de", name: "sender" }, hops: 5 } });
+    // a note pi refused is not announced
+    pi.sendMessage = () => { throw new Error("stale extension runtime: pi.sendMessage"); };
+    await assert.rejects(sendNote(entry.path, noteTo(entry)));
+    assert.equal(host.events.length, 2);
+    // a throwing event bus does not reject an accepted note
+    pi.sendMessage = realSendMessage;
+    (host.pi as unknown as { events: { emit: () => void } }).events.emit = () => { throw new Error("listener failed"); };
+    assert.equal((await sendNote(entry.path, noteTo(entry))).status, "delivered");
   });
 
   it("a failed pi.sendMessage rejects the note without consuming a wake slot or advancing the hop chain", async () => {

@@ -54,6 +54,8 @@ export class FakeHost {
   readonly commands = new Map<string, FakeCommand>();
   readonly sent: SentMessage[] = [];
   readonly userMessages: { content: string | unknown[]; options?: Record<string, unknown> }[] = [];
+  /** `pi.events.emit` calls, in order. */
+  readonly events: { channel: string; data: unknown }[] = [];
   editorText = "";
   readonly notifications: Notification[] = [];
   readonly statuses: (string | undefined)[] = [];
@@ -96,6 +98,16 @@ export class FakeHost {
       sendUserMessage: (content: string | unknown[], options?: Record<string, unknown>) => {
         guard("pi.sendUserMessage");
         this.userMessages.push({ content, ...(options ? { options } : {}) });
+      },
+      events: {
+        emit: (channel: string, data: unknown) => {
+          guard("pi.events.emit");
+          this.events.push({ channel, data });
+        },
+        on: () => {
+          guard("pi.events.on");
+          return () => undefined;
+        },
       },
       getSessionName: () => {
         guard("pi.getSessionName");

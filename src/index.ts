@@ -52,6 +52,21 @@ import { createQueueWiring } from "./queue.ts";
 export type SessionBusMode = ExtensionContext["mode"];
 
 export const MESSAGE_TYPE = "session-bus.message";
+/**
+ * `pi.events` channel announced once per note Pi accepted, right after `pi.sendMessage` returned (a woken note is already queued
+ * as a steer then). Payload: {@link SessionBusMessageEvent}. Other extensions use it to notice input for the agent that Pi itself does not
+ * announce (custom steer messages fire no `input` event), e.g. pi-orche detaches a call waiting for a background task. It carries
+ * no note content: the note reaches the agent only as the `session-bus.message` custom message.
+ */
+export const MESSAGE_EVENT = "session-bus:message";
+export interface SessionBusMessageEvent {
+  /** The note id (`details.note.id` of the custom message). */
+  id: string;
+  /** "started" | "queued": the note wakes the agent; "suppressed": delivered without a wake. */
+  wake: WakeStatus;
+  from: { id: string; name?: string };
+  hops: number;
+}
 export const STATUS_KEY = "session-bus";
 export const USAGE = "Usage: /bus [list] | /bus send <to> <text> | /bus wake on|off";
 export const DEFAULT_ALLOWED_MODES: readonly SessionBusMode[] = ["tui", "rpc"];
@@ -271,6 +286,13 @@ export function createSessionBusExtension(options: SessionBusOptions = {}): (pi:
       // consume a wake slot or advance the hop chain.
       policy.onDelivered(note.hops);
       if (decision.wake) policy.recordWake();
+      // Announce it to other extensions (best effort: a listener's failure must not reject an accepted note).
+      try {
+        const event: SessionBusMessageEvent = { id: note.id, wake, from: { id: note.from.id, ...(note.from.name ? { name: note.from.name } : {}) }, hops: note.hops };
+        pi.events?.emit(MESSAGE_EVENT, event);
+      } catch {
+        /* no event bus (old host) or a stale runtime */
+      }
       const response: NoteDelivered = { v: PROTOCOL_VERSION, ok: true, status: "delivered", wake };
       if (suppressedReason !== undefined) response.reason = suppressedReason;
       return response;
