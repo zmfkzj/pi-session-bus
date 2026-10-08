@@ -1,13 +1,47 @@
 /** Opt-in, cooperative repository queue wiring. Shared JSON, never a socket, grants a turn. */
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
 import { realpath } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, InputEvent, InputEventResult } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { createQueueStore, nudgePromoted, probeHolder, type QueueEntry, type QueueStore } from "./core/index.ts";
+import { createQueueStore, LegacyQueueError, nudgePromoted, probeHolder, QueueFencedError, type QueueEntry, type QueueMutation, type QueueStore } from "./core/index.ts";
 
 export const QUEUE_STATUS_KEY = "session-bus-queue";
 export const QUEUE_MESSAGE_TYPE = "session-bus.queue-turn";
+/** pi-images' `ATTACHMENTS_CHANNEL`: the images that extension attaches to a prompt this queue holds back. */
+export const IMAGE_ATTACHMENTS_CHANNEL = "pi-images:attachments";
+/** Absolute paths named like Pi's clipboard image files, which pi-images attaches by name when a prompt is submitted. */
+const CLIPBOARD_PATH = /(?<=^|\s)\/\S*?(?:pi-clipboard-[\da-f-]+|herdr-clipboard-images-\d+\/[^/\s]+)\.(?:png|jpe?g|webp|gif)(?=\s|$)/gi;
+const IMAGE_EXTENSIONS: Record<string, string> = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif" };
+/**
+ * The text of a prompt with its images saved where they can be submitted again: images not already in a clipboard
+ * file the text names are written to new private clipboard-named files in the temporary directory, whose paths are
+ * appended on their own line. pi-images attaches them by name when the text is submitted again.
+ */
+export function restorableText(prompt: { text: string; images?: readonly ImageContent[] }, dir = tmpdir()): { text: string; saved: number; lost: number } {
+  if (!prompt.images?.length) return { text: prompt.text, saved: 0, lost: 0 };
+  const named = new Set<string>();
+  for (const [path] of prompt.text.matchAll(CLIPBOARD_PATH)) {
+    try { named.add(readFileSync(path).toString("base64")); } catch { /* gone: save the image again */ }
+  }
+  const paths: string[] = [];
+  let lost = 0;
+  for (const image of prompt.images) {
+    if (named.has(image.data)) continue;
+    const extension = IMAGE_EXTENSIONS[image.mimeType];
+    const path = join(dir, `pi-clipboard-${randomUUID()}.${extension}`);
+    try {
+      if (!extension) throw new Error(`unsupported image type ${image.mimeType}`);
+      writeFileSync(path, Buffer.from(image.data, "base64"), { mode: 0o600, flag: "wx" });
+      named.add(image.data); paths.push(path);
+    } catch { lost++; }
+  }
+  return { text: paths.length ? `${prompt.text}\n${paths.join(" ")}` : prompt.text, saved: paths.length, lost };
+}
 export async function resolveGitToplevel(cwd: string): Promise<string> {
   const path = await new Promise<string>((resolve, reject) => {
     execFile("git", ["rev-parse", "--show-toplevel"], { cwd, timeout: 5000 }, (error, stdout) => {
@@ -30,6 +64,8 @@ export interface QueueWiringOptions {
   idleMs?: number;
   pollMs?: number;
   gitToplevel?: (cwd: string) => Promise<string> | string;
+  /** Where images of prompts restored to the editor are saved (default: the system temporary directory). */
+  imageDir?: () => string;
 }
 const flat = (s: string, max = 80): string => s.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ").replace(/"/g, "'").trim().slice(0, max);
 const label = (e: QueueEntry): string => e.name ? `"${flat(e.name)}" (id ${e.endpointId})` : `id ${e.endpointId}`;
@@ -60,6 +96,8 @@ export function createQueueWiring(pi: ExtensionAPI, options: QueueWiringOptions)
   let checking: Promise<void> | undefined;
   let operations: Promise<unknown> = Promise.resolve();
   let generation = 0;
+  /** Pids of older session-bus versions that use the previous (v1) queue: prompts are held, not run, meanwhile. */
+  let legacy: number[] | undefined;
 
   function serial<T>(fn: () => Promise<T>): Promise<T> {
     const result = operations.then(fn);
@@ -68,7 +106,29 @@ export function createQueueWiring(pi: ExtensionAPI, options: QueueWiringOptions)
   }
   function context() { return live ? options.context() : undefined; }
   function notify(text: string, level: "info" | "warning" = "info") { context()?.ui.notify(text, level); }
-  function warning(error: unknown) { notify(`Work queue I/O failed; prompts run without the turn: ${flat(String(error), 200)}`, "warning"); }
+  function warning(error: unknown) {
+    if (error instanceof LegacyQueueError) { block(error.pids); return; }
+    const reason = error instanceof QueueFencedError ? "Work queue update interrupted" : "Work queue I/O failed";
+    notify(`${reason}; prompts run without the turn: ${flat(String(error), 300)}`, "warning");
+  }
+  /**
+   * The two protocols cannot exclude each other, so neither failing open nor touching the older session's files is
+   * safe: prompts are held until the older session has no turn and no lock, which the poll rechecks.
+   */
+  function block(pids: number[]) {
+    const changed = legacy?.join() !== pids.join();
+    legacy = pids;
+    if (changed) {
+      notify(`An older session-bus (pid ${pids.join(", ")}) still uses this repository's previous work queue, which cannot exclude this one, so prompts are held here, not run. In that session run /queue off (or finish its turn), then reload it. Keep this session running: held prompts run in order, with their images, once no older session holds a turn. /queue off here returns them to the editor instead.`, "warning");
+    }
+    status(); poll();
+  }
+  function hold(prompt: Prompt, quiet = false): InputEventResult {
+    deferred.push(prompt);
+    if (!quiet) notify(`held: an older session-bus (pid ${legacy!.join(", ")}) uses the previous work queue`, "warning");
+    status(); poll();
+    return { action: "handled" };
+  }
   function activateDone(active: boolean) {
     try {
       if (typeof pi.getActiveTools !== "function" || typeof pi.setActiveTools !== "function") return;
@@ -106,7 +166,8 @@ export function createQueueWiring(pi: ExtensionAPI, options: QueueWiringOptions)
     let text: string | undefined;
     if (mode) {
       text = role === "holding" ? `queue: turn${running ? "" : " (idle)"}` : "queue: on";
-      if (role === "waiting") {
+      if (legacy) text = "queue: held (older session-bus)";
+      else if (role === "waiting") {
         try { text = `queue: #${store!.read().entries.findIndex(e => e.id === entryId) + 1}`; } catch { text = "queue: waiting"; }
       }
     }
@@ -121,14 +182,21 @@ export function createQueueWiring(pi: ExtensionAPI, options: QueueWiringOptions)
     deferred = []; followUps = [];
     const c = context();
     if (!c || !prompts.length) return;
-    const text = prompts.map(p => p.text).join("\n\n");
+    // Images are saved as clipboard files named in the text, so submitting the text again attaches them (pi-images).
+    let saved = 0; let lost = 0;
+    const text = prompts.map(p => {
+      const restored = restorableText(p, options.imageDir?.());
+      saved += restored.saved; lost += restored.lost;
+      return restored.text;
+    }).join("\n\n");
     try { c.ui.setEditorText([c.ui.getEditorText(), text].filter(Boolean).join("\n\n")); }
     catch { notify(`Could not restore deferred prompts to the editor:\n${text}`, "warning"); }
-    if (prompts.some(p => p.images?.length)) notify("Deferred text restored; attached images cannot be restored to the editor.", "warning");
+    if (saved) notify(`Deferred prompts restored to the editor; ${saved} image(s) were saved as clipboard files named after their prompt and are attached again when you submit it.`);
+    if (lost) notify(`${lost} image(s) of the deferred prompts could not be saved and are not restored.`, "warning");
   }
   function poll() {
     clearTimeout(pollTimer);
-    if (!live || closing || role === "none" && !cancelledId) return;
+    if (!live || closing || role === "none" && !cancelledId && !legacy) return;
     pollTimer = setTimeout(() => { pollTimer = undefined; void check().finally(poll); }, pollMs);
     pollTimer.unref();
   }
@@ -154,6 +222,21 @@ export function createQueueWiring(pi: ExtensionAPI, options: QueueWiringOptions)
       details: { repo: store!.repo, waiting: count },
     };
   }
+  /**
+   * Images that the images extension would attach to this prompt (new ones only). Asked synchronously on submission:
+   * that extension's input handler may run after this one, or never for a prompt that is held back and replayed as
+   * an extension message. Without it, nothing is provided.
+   */
+  function pastedImages(text: string, existing: readonly ImageContent[]): ImageContent[] {
+    let images: ImageContent[] = [];
+    try {
+      pi.events.emit(IMAGE_ATTACHMENTS_CHANNEL, {
+        text, cwd: context()?.cwd, existing,
+        provide: (found: unknown) => { if (Array.isArray(found)) images = found as ImageContent[]; },
+      });
+    } catch (error) { notify(`Could not attach pasted images: ${flat(String(error), 200)}`, "warning"); }
+    return images;
+  }
   function send(prompt: Prompt, followUp: boolean) {
     const content = prompt.images?.length ? [{ type: "text" as const, text: prompt.text }, ...prompt.images] : prompt.text;
     pi.sendUserMessage(content, { expandPromptTemplates: true, ...(followUp ? { deliverAs: "followUp" as const } : {}) });
@@ -171,6 +254,9 @@ export function createQueueWiring(pi: ExtensionAPI, options: QueueWiringOptions)
     status(); poll();
     if (!replay || replayedId === entry.id) return;
     replayedId = entry.id;
+    replayDeferred(busy);
+  }
+  function replayDeferred(busy: boolean) {
     const prompts = deferred.splice(0);
     if (!prompts.length) return;
     if (busy) {
@@ -181,6 +267,28 @@ export function createQueueWiring(pi: ExtensionAPI, options: QueueWiringOptions)
       followUps.push(...prompts.slice(1));
       send(prompts[0]!, false);
     }
+  }
+  /** Whether the older session is gone; held prompts then take the normal path to the turn. */
+  async function unblock(): Promise<boolean> {
+    let result: QueueMutation;
+    try { result = await store!.mutate(() => {}); }
+    catch (error) { if (error instanceof LegacyQueueError) { block(error.pids); return false; } throw error; }
+    legacy = undefined; status();
+    if (!deferred.length) return true;
+    notify("The older session-bus no longer uses the previous work queue; held prompts continue.");
+    const entry = result.file.entries.find(e => e.id === entryId);
+    if (role === "holding" && entry?.state === "active") { replayDeferred(running || !context()!.isIdle()); return true; }
+    if (role === "holding") lostTurn();
+    if (role === "none") {
+      const queued = await store!.enqueue({ ...own!, pid: process.pid, title: deferred[0]!.text });
+      if (!live || closing) return false;
+      entryId = queued.entry.id;
+      if (queued.entry.state === "active") { acquire(queued.entry, true); return false; }
+      role = "waiting"; status();
+      notify(`queued #${queued.position} behind ${queued.holder ? label(queued.holder) : "the holder"}`);
+      if (queued.promoted) await nudge(queued.promoted);
+    }
+    return true;
   }
   async function nudge(entry: QueueEntry | undefined) {
     try {
@@ -221,6 +329,7 @@ export function createQueueWiring(pi: ExtensionAPI, options: QueueWiringOptions)
   }
   async function gate(prompt: Prompt): Promise<InputEventResult> {
     if (!live || closing || !mode) return { action: "continue" };
+    if (legacy) return hold(prompt);
     try {
       await removeCancelled();
       if (role === "holding") {
@@ -262,6 +371,7 @@ export function createQueueWiring(pi: ExtensionAPI, options: QueueWiringOptions)
       if (result.promoted) await nudge(result.promoted);
       return { action: "handled" };
     } catch (error) {
+      if (error instanceof LegacyQueueError) { block(error.pids); return hold(prompt, true); }
       warning(error);
       // A failed new acquisition has not consumed this prompt. Do not retain it for replay.
       return { action: "continue" };
@@ -291,8 +401,9 @@ export function createQueueWiring(pi: ExtensionAPI, options: QueueWiringOptions)
     return release();
   }
   async function checkBody() {
-    if (!live || closing || !store || role === "none" && !cancelledId) return;
+    if (!live || closing || !store || role === "none" && !cancelledId && !legacy) return;
     try {
+      if (legacy && !await unblock()) return;
       // A pending running/idle hold write must precede reads and cooperative cleanup.
       if (role === "holding" && expiryDirty) await writeHold();
       await removeCancelled();
@@ -383,6 +494,9 @@ export function createQueueWiring(pi: ExtensionAPI, options: QueueWiringOptions)
   pi.registerCommand("queue", {
     description: "Repository work queue: /queue [list|on|off|done|<prompt>]",
     async handler(args) {
+      // An extension command never reaches input handlers: attach pasted images of a prompt before any await.
+      const words = args.trim();
+      const images = ["", "list", "on", "off", "done"].includes(words.toLowerCase()) ? [] : pastedImages(words, []);
       await serial(async () => {
         if (!live || closing) return;
         const text = args.trim(); const cmd = text.toLowerCase();
@@ -393,6 +507,7 @@ export function createQueueWiring(pi: ExtensionAPI, options: QueueWiringOptions)
           if (cmd === "off") {
             mode = false; activateDone(false); status();
             try {
+              if (legacy) { legacy = undefined; restore(); }
               if (role === "waiting") {
                 cancelledId = entryId;
                 role = "none"; entryId = undefined; restore();
@@ -418,8 +533,9 @@ export function createQueueWiring(pi: ExtensionAPI, options: QueueWiringOptions)
           if (!await enable()) return;
           activateDone(true);
           options.resetChain();
-          const result = await gate({ text });
-          if (live && !closing && result.action === "continue") send({ text }, running || !context()!.isIdle());
+          const prompt = { text, ...(images.length ? { images } : {}) };
+          const result = await gate(prompt);
+          if (live && !closing && result.action === "continue") send(prompt, running || !context()!.isIdle());
         } catch (error) { warning(error); }
       });
     },
@@ -429,13 +545,20 @@ export function createQueueWiring(pi: ExtensionAPI, options: QueueWiringOptions)
     start() {
       generation++; live = true; closing = false; mode = false; role = "none";
       store = undefined; own = undefined; entryId = undefined; deferred = []; followUps = [];
-      cancelledId = undefined;
+      cancelledId = undefined; legacy = undefined;
       running = false; releaseAtSettle = noticePending = expiryDirty = false; replayedId = undefined;
       clearTimers(); activateDone(false); status();
     },
     input(event: InputEvent): Promise<InputEventResult> | undefined {
       if (!live || closing || !mode || event.source === "extension") return;
-      return serial(() => gate({ text: event.text, ...(event.images ? { images: event.images } : {}) }));
+      const existing = event.images ?? [];
+      const added = pastedImages(event.text, existing);
+      const images = [...existing, ...added];
+      return serial(async (): Promise<InputEventResult> => {
+        const result = await gate({ text: event.text, ...(images.length ? { images } : {}) });
+        // A prompt that runs now carries the images too; the images extension does not attach them twice.
+        return result.action === "continue" && added.length ? { action: "transform", text: event.text, images } : result;
+      });
     },
     onNudge(key: string) {
       if (!live || closing || key !== store?.key || nudgeTimer) return;
@@ -460,7 +583,7 @@ export function createQueueWiring(pi: ExtensionAPI, options: QueueWiringOptions)
         } catch (error) { if (live && generation === version) notify(`Work queue shutdown cleanup failed: ${flat(String(error), 200)}`, "warning"); }
       });
       await Promise.race([cleanup, new Promise<void>(resolve => { timeout = setTimeout(resolve, 900); })]);
-      clearTimeout(timeout); live = false; role = "none"; entryId = undefined;
+      clearTimeout(timeout); live = false; role = "none"; entryId = undefined; legacy = undefined;
     },
   };
 }

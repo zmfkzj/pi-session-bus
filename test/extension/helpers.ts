@@ -56,6 +56,8 @@ export class FakeHost {
   readonly userMessages: { content: string | unknown[]; options?: Record<string, unknown> }[] = [];
   /** `pi.events.emit` calls, in order. */
   readonly events: { channel: string; data: unknown }[] = [];
+  /** Stands in for the images extension on its attachments channel (`pi-images:attachments`). */
+  imageProvider?: (request: { text: string; existing: readonly unknown[] }) => unknown[];
   editorText = "";
   readonly notifications: Notification[] = [];
   readonly statuses: (string | undefined)[] = [];
@@ -103,6 +105,8 @@ export class FakeHost {
         emit: (channel: string, data: unknown) => {
           guard("pi.events.emit");
           this.events.push({ channel, data });
+          const request = data as { text: string; existing: readonly unknown[]; provide(images: unknown[]): void };
+          if (channel === "pi-images:attachments" && this.imageProvider) request.provide(this.imageProvider(request));
         },
         on: () => {
           guard("pi.events.on");

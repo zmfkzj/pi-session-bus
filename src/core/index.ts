@@ -16,3 +16,4 @@ export * from "./protocol.ts";
 export * from "./registry.ts";
 export * from "./resolve.ts";
 export * from "./queue.ts";
+export { QueueFencedError, STALE_LOCK_MS } from "./queue-log.ts";

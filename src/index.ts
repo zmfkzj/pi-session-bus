@@ -98,6 +98,8 @@ export interface SessionBusOptions {
   queuePollMs?: number;
   /** Injectable git toplevel resolver; default git rev-parse then realpath. */
   gitToplevel?: (cwd: string) => Promise<string> | string;
+  /** Directory for images of queued prompts restored to the editor (default: the system temporary directory). */
+  queueImageDir?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +207,7 @@ export function createSessionBusExtension(options: SessionBusOptions = {}): (pi:
       ...(options.queueIdleMs === undefined ? {} : { idleMs: options.queueIdleMs }),
       ...(options.queuePollMs === undefined ? {} : { pollMs: options.queuePollMs }),
       ...(options.gitToplevel === undefined ? {} : { gitToplevel: options.gitToplevel }),
+      ...(options.queueImageDir === undefined ? {} : { imageDir: () => options.queueImageDir! }),
     });
 
     function notifyOnce(key: string, message: string, level: "info" | "warning" | "error"): void {

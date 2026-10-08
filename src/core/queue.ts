@@ -1,11 +1,8 @@
 /** Repository work queue. Atomic JSON snapshots are authoritative; sockets only nudge. */
 import { createHash, randomUUID } from "node:crypto";
-import {
-  closeSync, constants, fstatSync, lstatSync, openSync, readFileSync,
-  renameSync, unlinkSync, writeFileSync,
-} from "node:fs";
 import { dirname, join } from "node:path";
 import { helloProbe, isGone, isStaleError, sendQueueNudge } from "./endpoint.ts";
+import { publishGeneration, readPrivate, readSnapshot, STALE_LOCK_MS, voidGeneration, withGeneration, type HeldGeneration } from "./queue-log.ts";
 import { ensurePrivateDir, listSockets, type SocketPathOptions } from "./registry.ts";
 
 export interface QueueEntry {
@@ -34,12 +31,13 @@ export interface QueueStoreOptions {
   repo: string;
   idleMs?: number;
   now?: () => number;
-  /** Lock acquisition deadline uses wall time, never the injectable queue clock. */
+  /** Lock acquisition deadline, measured by the monotonic clock (never the injectable queue clock). */
   lockTimeoutMs?: number;
 }
 export interface QueueStore {
   readonly key: string;
   readonly repo: string;
+  /** Directory of the queue's lock generations and snapshots (`<bus dir>/queue/<key>.v2`). */
   readonly path: string;
   read(): QueueFile;
   mutate(fn: (file: QueueFile, now: number) => void): Promise<QueueMutation>;
@@ -76,25 +74,9 @@ function validEntry(value: unknown): value is QueueEntry {
     && (value.holdExpiresAt === null || (typeof value.holdExpiresAt === "number" && Number.isFinite(value.holdExpiresAt)));
 }
 
-/** Never follow a file symlink, and refuse nonregular or foreign-owned files. */
-function readPrivate(path: string): { text: string; ino: number; mtimeMs: number } {
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  try {
-    const st = fstatSync(fd);
-    if (!st.isFile() || (process.getuid && st.uid !== process.getuid())) {
-      throw new Error(`unsafe queue file: ${path}`);
-    }
-    return { text: readFileSync(fd, "utf8"), ino: st.ino, mtimeMs: st.mtimeMs };
-  } finally { closeSync(fd); }
-}
-function readQueue(path: string, repo: string): QueueFile {
+function parseQueue(text: string | undefined, repo: string): QueueFile {
   const empty: QueueFile = { v: 1, repo, entries: [] };
-  let text: string;
-  try { text = readPrivate(path).text; }
-  catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return empty;
-    throw err;
-  }
+  if (text === undefined) return empty;
   let value: unknown;
   try { value = JSON.parse(text); } catch { return empty; }
   if (!record(value) || value.v !== 1 || value.repo !== repo || !Array.isArray(value.entries)) return empty;
@@ -104,6 +86,10 @@ function readQueue(path: string, repo: string): QueueFile {
     state: entry.state, enqueuedAt: entry.enqueuedAt,
     ...(entry.grantedAt === undefined ? {} : { grantedAt: entry.grantedAt }), holdExpiresAt: entry.holdExpiresAt,
   })) };
+}
+function readFileText(path: string): string | undefined {
+  try { return readPrivate(path).text; }
+  catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw err; }
 }
 
 /** In-place invariant repair. File order is FIFO; any extra active entries become waiters. */
@@ -135,79 +121,85 @@ export function normalizeQueue(file: QueueFile, now: number, idleMs: number): Qu
   return promoted;
 }
 
-function unlock(path: string, token: string): void {
-  try {
-    const snapshot = readPrivate(path);
-    const value: unknown = JSON.parse(snapshot.text);
-    if (record(value) && value.token === token && lstatSync(path).ino === snapshot.ino) unlinkSync(path);
-  } catch { /* Missing or replaced: never unlink someone else's lock. */ }
-}
-function reclaimLock(path: string): void {
-  try {
-    const snapshot = readPrivate(path);
-    let dead = false;
-    try {
-      const value: unknown = JSON.parse(snapshot.text);
-      dead = record(value) && Number.isSafeInteger(value.pid) && (value.pid as number) > 0 && isGone(value.pid as number);
-    } catch { /* An incomplete/malformed lock is reclaimable only after its age deadline. */ }
-    if ((dead || Date.now() - snapshot.mtimeMs > 10_000) && lstatSync(path).ino === snapshot.ino) unlinkSync(path);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+/** Sessions still on queue protocol v1 (`<key>.lock` and `<key>.json`), which cannot see the v2 queue. */
+export class LegacyQueueError extends Error {
+  readonly pids: number[];
+  constructor(pids: number[], path: string) {
+    super(`an older session-bus (pid ${pids.join(", ")}) holds the previous work queue ${path} and cannot see this one; reload or quit that session`);
+    this.name = "LegacyQueueError";
+    this.pids = pids;
   }
+}
+/**
+ * Live foreign pids that hold the v1 lock right now or the v1 turn. v1 files are only read, never changed: their
+ * waiters cannot take a turn without a v1 holder, and dead or expired holders are ignored.
+ */
+function legacyPids(lockPath: string, queuePath: string, repo: string, time: number): number[] {
+  const pids = new Set<number>();
+  const live = (pid: number): boolean => pid !== process.pid && !isGone(pid);
+  try {
+    const lock = readPrivate(lockPath);
+    const value: unknown = JSON.parse(lock.text);
+    if (record(value) && Number.isSafeInteger(value.pid) && (value.pid as number) > 0
+      && Date.now() - lock.mtimeMs <= STALE_LOCK_MS && live(value.pid as number)) pids.add(value.pid as number);
+  } catch { /* none, malformed or not a regular file */ }
+  try {
+    for (const entry of parseQueue(readFileText(queuePath), repo).entries) {
+      if (entry.state === "active" && (entry.holdExpiresAt === null || entry.holdExpiresAt > time) && live(entry.pid)) pids.add(entry.pid);
+    }
+  } catch { /* unreadable: nothing to honor */ }
+  return [...pids];
 }
 
 export function createQueueStore(options: QueueStoreOptions): QueueStore {
   const key = queueKey(options.repo);
   const dir = join(options.busDir, "queue");
-  const path = join(dir, `${key}.json`);
-  const lock = join(dir, `${key}.lock`);
+  const path = join(dir, `${key}.v2`);
+  const legacyQueue = join(dir, `${key}.json`);
+  const legacyLock = join(dir, `${key}.lock`);
   const now = options.now ?? Date.now;
   const idleMs = options.idleMs ?? 600_000;
-  const prepare = (): void => { ensurePrivateDir(options.busDir); ensurePrivateDir(dir); };
-  async function mutate(fn: (file: QueueFile, now: number) => void): Promise<QueueMutation> {
-    prepare();
-    const token = randomUUID();
-    const deadline = Date.now() + (options.lockTimeoutMs ?? 2000);
-    for (;;) {
-      let fd: number;
-      try { fd = openSync(lock, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600); }
-      catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-        reclaimLock(lock);
-        if (Date.now() >= deadline) throw new Error(`work queue lock timed out: ${lock}`);
-        await new Promise<void>((resolve) => setTimeout(resolve, 10 + Math.floor(Math.random() * 25)));
-        continue;
+  const prepare = (): void => { ensurePrivateDir(options.busDir); ensurePrivateDir(dir); ensurePrivateDir(path); };
+  /** The critical section: synchronous from the lock through publication of the generation's snapshot. */
+  function section(held: HeldGeneration, fn: (file: QueueFile, now: number) => void): QueueMutation {
+    let base: string | undefined;
+    let readable = false;
+    let published = false;
+    try {
+      base = readSnapshot(held.dir, held.gen);
+      readable = true;
+      const time = now();
+      const legacy = legacyPids(legacyLock, legacyQueue, options.repo, time);
+      if (legacy.length) throw new LegacyQueueError(legacy, legacyQueue);
+      const file = parseQueue(base, options.repo);
+      const prior = file.entries.find((entry) => entry.state === "active")?.id;
+      normalizeQueue(file, time, idleMs);
+      const result: unknown = fn(file, time);
+      if (result && typeof (result as { then?: unknown }).then === "function") {
+        throw new Error("queue mutations must be synchronous");
       }
-      // No await from creation of the lock through unlink: all critical-section I/O is synchronous.
-      let tmp: string | undefined;
-      try {
-        try { writeFileSync(fd, JSON.stringify({ pid: process.pid, token })); }
-        finally { closeSync(fd); }
-        const time = now();
-        const file = readQueue(path, options.repo);
-        const prior = file.entries.find((entry) => entry.state === "active")?.id;
-        normalizeQueue(file, time, idleMs);
-        const result: unknown = fn(file, time);
-        if (result && typeof (result as { then?: unknown }).then === "function") {
-          throw new Error("queue mutations must be synchronous");
-        }
-        normalizeQueue(file, time, idleMs);
-        tmp = join(dir, `${key}.${token}.tmp`);
-        const out = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-        try { writeFileSync(out, JSON.stringify(file)); } finally { closeSync(out); }
-        renameSync(tmp, path);
-        tmp = undefined;
-        const holder = file.entries[0];
-        return { file, ...(holder?.state === "active" && holder.id !== prior ? { promoted: holder } : {}) };
-      } finally {
-        if (tmp) { try { unlinkSync(tmp); } catch { /* best effort */ } }
-        unlock(lock, token);
+      normalizeQueue(file, time, idleMs);
+      publishGeneration(held, JSON.stringify(file));
+      published = true;
+      const holder = file.entries[0];
+      return { file, ...(holder?.state === "active" && holder.id !== prior ? { promoted: holder } : {}) };
+    } finally {
+      // Release unchanged: republish the base, or without a readable base void the generation.
+      if (!published) {
+        try {
+          if (readable) publishGeneration(held, base ?? JSON.stringify({ v: 1, repo: options.repo, entries: [] }));
+          else voidGeneration(held);
+        } catch { /* fenced or I/O failure: the generation is reclaimed after its lease */ }
       }
     }
   }
+  async function mutate(fn: (file: QueueFile, now: number) => void): Promise<QueueMutation> {
+    prepare();
+    return withGeneration(path, options.lockTimeoutMs ?? 2000, (held) => section(held, fn));
+  }
   const store: QueueStore = {
     key, repo: options.repo, path,
-    read() { prepare(); return readQueue(path, options.repo); },
+    read() { prepare(); return parseQueue(readSnapshot(path), options.repo); },
     mutate,
     async enqueue(owner) {
       let id: string = "";

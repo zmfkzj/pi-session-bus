@@ -25,6 +25,8 @@ import {
   SessionManager,
   SettingsManager,
   type AgentSession,
+  type ExtensionAPI,
+  type ExtensionFactory,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { createQueueStore, deriveId, listSockets, socketFileName } from "../../src/core/index.ts";
@@ -89,7 +91,12 @@ afterEach(async () => {
   const sharedRepo = join(tmp, "shared-repo");
   if (existsSync(join(busDir, "queue"))) {
     assert.equal(createQueueStore({ busDir, repo: sharedRepo }).read().entries.length, 0, "shutdown removes every queue entry");
-    assert.ok(readdirSync(join(busDir, "queue")).every(name => name.endsWith(".json")), "no locks or temporary files remain");
+    for (const name of readdirSync(join(busDir, "queue"))) {
+      assert.match(name, /^[0-9a-f]{16}\.v2$/, "only v2 queue directories, no v1 files");
+      const names = readdirSync(join(busDir, "queue", name));
+      assert.ok(names.every(file => /^L\d{15}$/.test(file) ? names.includes(`S${file.slice(1)}.json`) || names.includes(`V${file.slice(1)}`) : /^[SV]\d{15}(\.json)?$/.test(file)),
+        `every lock generation is released and no temporary files remain: ${names.join()}`);
+    }
   }
   removeTempDir(tmp);
 });
@@ -99,13 +106,16 @@ async function makeNode(
   extensionOptions: SessionBusOptions = {},
   customTools: ReturnType<typeof defineTool>[] = [],
   cwdOverride?: string,
+  /** Extensions loaded after session-bus (as in the umbrella manifest); they get a vision model. */
+  laterExtensions: ExtensionFactory[] = [],
 ): Promise<Node> {
   const cwd = cwdOverride ?? join(tmp, `cwd-${name}`);
   const agentDir = join(tmp, `agent-${name}`);
   mkdirSync(cwd, { recursive: true });
   mkdirSync(agentDir, { recursive: true });
 
-  const faux = fauxProvider({ provider: `bus-faux-${++serial}` });
+  const faux = fauxProvider({ provider: `bus-faux-${++serial}`,
+    ...(laterExtensions.length ? { models: [{ id: "faux-vision", input: ["text", "image"] as ("text" | "image")[] }] } : {}) });
   const runtime = await ModelRuntime.create({
     credentials: new InMemoryCredentialStore(),
     modelsPath: null,
@@ -123,7 +133,7 @@ async function makeNode(
     cwd,
     agentDir,
     settingsManager,
-    extensionFactories: [createSessionBusExtension({ busDir, ...extensionOptions })],
+    extensionFactories: [createSessionBusExtension({ busDir, ...extensionOptions }), ...laterExtensions],
     noSkills: true,
     noPromptTemplates: true,
     noThemes: true,
@@ -422,6 +432,51 @@ describe("two real Pi sessions on one bus", () => {
     assert.ok(b.requests[0]!.includes("Call queue_done"));
     assert.ok(b.requests[0]!.includes("not asking or waiting for the user's reply"));
     assert.equal(b.runs, 1);
+  });
+
+  it("repository queue: a deferred prompt keeps the images the images extension attaches, and the model gets them once", async () => {
+    const repo = join(tmp, "image-repo");
+    mkdirSync(repo); execFileSync("git", ["init", "--quiet", repo]);
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+    const image = { type: "image" as const, data: png, mimeType: "image/png" };
+    // The contract of pi-images, loaded after session-bus as in the umbrella manifest: it attaches the image of a
+    // pasted `shot.png` to interactive/RPC input and answers the queue's attachments request, never twice.
+    const images: ExtensionFactory = (pi: ExtensionAPI) => {
+      const attach = (text: string, existing: readonly { data: string }[]) =>
+        text.includes("shot.png") && !existing.some((i) => i.data === png) ? [image] : [];
+      pi.on("input", (event) => {
+        if (event.source === "extension") return { action: "continue" };
+        const added = attach(event.text, event.images ?? []);
+        return added.length ? { action: "transform", text: event.text, images: [...(event.images ?? []), ...added] } : { action: "continue" };
+      });
+      pi.events.on("pi-images:attachments", (data) => {
+        const request = data as { text: string; existing?: { data: string }[]; provide(images: unknown[]): void };
+        request.provide(attach(request.text, request.existing ?? []));
+      });
+    };
+    const a = await makeNode("alpha-img", { queuePollMs: 20 }, [], repo, [images]);
+    const b = await makeNode("beta-img", { queuePollMs: 60_000 }, [], repo, [images]);
+    const finish = deferred();
+    a.script([async () => { await finish.promise; return call("queue_done", {}); }, () => say("A's task is complete.")]);
+    b.script([() => say("B looked at the image."), () => say("B looked again.")]);
+    await a.session.prompt("/queue implement A's change");
+    await waitFor(() => a.requests.length === 1, "A to hold and run");
+    await b.session.prompt("/queue on");
+    await b.session.prompt("describe shot.png please", { source: "rpc" });
+    assert.equal(b.requests.length, 0, "B's prompt is held back");
+    finish.resolve();
+    await a.session.waitForIdle();
+    await waitFor(() => b.requests.length === 1, "B's deferred prompt to run after handoff");
+    await b.session.waitForIdle();
+    const users = (b.session.messages as unknown as { role: string; content: { type: string; text?: string }[] }[]).filter((m) => m.role === "user");
+    assert.equal(users.length, 1);
+    assert.deepEqual(users[0]!.content.map((block) => block.type), ["text", "image"]);
+    assert.ok(b.requests[0]!.includes("describe shot.png please"));
+    assert.equal(b.requests[0]!.split(png).length - 1, 1, "the model request carries the image once");
+    // B now holds the turn: its next prompt runs at once and still carries the image exactly once.
+    await b.session.prompt("compare shot.png again", { source: "rpc" });
+    await b.session.waitForIdle();
+    assert.equal(b.requests[1]!.split(png).length - 1, 2, "one image per user message");
   });
 
   it("repository queue: multiple deferred prompts replay in order as real streaming follow-ups", async () => {

@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import { createSessionBusExtension, type SessionBusOptions } from "../../src/index.ts";
 import { QUEUE_MESSAGE_TYPE } from "../../src/queue.ts";
 import { createNote, createQueueStore, deriveId, listSockets, queueKey, sendNote, sendQueueNudge } from "../../src/core/index.ts";
-import { makeTempDir, removeTempDir } from "../core/helpers.ts";
+import { holdQueueLock, makeTempDir, removeTempDir } from "../core/helpers.ts";
 import { FakeHost, type FakeHostOptions } from "./helpers.ts";
 
 let tmp: string;
@@ -38,7 +38,7 @@ function stubActiveTools(h: FakeHost, names = ["read", "bash", "edit"]) {
 async function host(opts: SessionBusOptions = {}, hostOpts: FakeHostOptions = {}) {
   const h = new FakeHost({ sessionId: `queue-session-${++serial}`, cwd: repo, sessionName: `worker-${serial}`, ...hostOpts });
   stubActiveTools(h);
-  createSessionBusExtension({ busDir, gitToplevel: async () => repo, queuePollMs: 20, ...opts })(h.pi);
+  createSessionBusExtension({ busDir, gitToplevel: async () => repo, queuePollMs: 20, queueImageDir: busDir, ...opts })(h.pi);
   hosts.push(h); await h.start(); return h;
 }
 const command = (h: FakeHost, text: string) => h.runCommand(text, "queue");
@@ -141,15 +141,14 @@ describe("repository queue wiring", () => {
     const a = await host({ now: () => clock, queuePollMs: 60_000 });
     await command(a, "task");
     const previousExpiry = store().read().entries[0]!.holdExpiresAt;
-    const path = join(busDir, "queue", `${queueKey(repo)}.lock`);
-    writeFileSync(path, JSON.stringify({ pid: process.pid, token: "held" }), { mode: 0o600 });
+    const held = holdQueueLock(busDir, repo);
     let completed = false;
     const gated = input(a, "continue task").then(result => { completed = true; return result; });
     await sleep(40);
     assert.equal(completed, false, "holder input must wait for the file lock");
     assert.equal(store().read().entries[0]!.holdExpiresAt, previousExpiry);
     clock += 10_000;
-    rmSync(path);
+    held.release();
     assert.deepEqual(await gated, { action: "continue" });
     assert.equal(store().read().entries[0]!.holdExpiresAt, clock + 600_000);
     a.idle = false; await a.fire("agent_start"); clock += 600_000;
@@ -199,15 +198,64 @@ describe("repository queue wiring", () => {
     assert.match(result.content[0]!.text, /does not hold/);
   });
 
-  it("/queue off restores deferred text to the editor, warns about images and stops gating", async () => {
+  it("/queue off restores deferred prompts to the editor, with their images saved as clipboard files, and stops gating", async () => {
     const a = await host(); const b = await host(); await waiting(a, b);
     b.editorText = "draft";
-    await input(b, "with image", "interactive", [{ type: "image", data: "AA==", mimeType: "image/png" }]);
+    await input(b, "with image", "interactive", [{ type: "image", data: "AA==", mimeType: "image/png" }, { type: "image", data: "AQ==", mimeType: "image/bmp" }]);
     await command(b, "OFF");
-    assert.equal(b.editorText, "draft\n\nB's task\n\nwith image");
+    const match = /^draft\n\nB's task\n\nwith image\n(\S+\/pi-clipboard-[0-9a-f-]{36}\.png)$/.exec(b.editorText);
+    assert.ok(match, b.editorText);
+    assert.ok(match[1]!.startsWith(busDir));
+    assert.equal(fs.readFileSync(match[1]!).toString("base64"), "AA==");
+    assert.equal(fs.statSync(match[1]!).mode & 0o777, 0o600);
     assert.equal(store().read().entries.length, 1);
-    assert.ok(b.notifications.some(n => /images cannot be restored/.test(n.message)));
+    assert.ok(b.notifications.some(n => /1 image\(s\) were saved as clipboard files/.test(n.message)));
+    assert.ok(b.notifications.some(n => /1 image\(s\) of the deferred prompts could not be saved/.test(n.message)), "an image type pi-images does not read");
     assert.equal(await input(b, "not queued"), undefined);
+  });
+
+  it("keeps pasted images of held-back prompts through replay exactly once, and attaches them to a prompt that runs now", async () => {
+    const a = await host(); const b = await host();
+    const clip = "/tmp/pi-clipboard-0f0f0f0f-0000-4000-8000-000000000000.png";
+    const pasted = { type: "image", data: "UE5H", mimeType: "image/png" };
+    const rpc = { type: "image", data: "QUJD", mimeType: "image/png" };
+    const asked: { text: string; existing: readonly unknown[] }[] = [];
+    // The images extension provides a pasted image once per prompt that mentions it, never one the prompt carries.
+    b.imageProvider = (request) => {
+      asked.push(request);
+      return request.text.includes(clip) && !request.existing.some(image => (image as { data: string }).data === pasted.data) ? [pasted] : [];
+    };
+    await holding(a); await command(b, "on");
+    assert.deepEqual(await input(b, `${clip} describe this`, "rpc", [rpc]), { action: "handled" });
+    assert.deepEqual(await input(b, `then compare ${clip}`), { action: "handled" });
+    assert.deepEqual(asked.map(request => request.existing.length), [1, 0], "asked on submission, with the images the prompt carries");
+    assert.equal(await input(b, `${clip} from an extension`, "extension"), undefined, "extension input is never given images");
+    assert.equal(asked.length, 2);
+    await command(a, "done"); a.idle = true; await a.fire("agent_settled");
+    await waitFor(() => b.userMessages.length === 1);
+    assert.deepEqual(b.userMessages[0]!.content, [{ type: "text", text: `${clip} describe this` }, rpc, pasted]);
+    b.idle = false; await b.fire("agent_start");
+    await waitFor(() => b.userMessages.length === 2);
+    assert.deepEqual(b.userMessages[1], { content: [{ type: "text", text: `then compare ${clip}` }, pasted], options: { expandPromptTemplates: true, deliverAs: "followUp" } });
+    // The holder's prompt runs now and carries its pasted image; the images extension adds none twice.
+    assert.deepEqual(await input(b, `and ${clip}`), { action: "transform", text: `and ${clip}`, images: [pasted] });
+    assert.deepEqual(await input(b, "no image"), { action: "continue" });
+  });
+
+  it("/queue <prompt> attaches its pasted images whether it runs now or waits", async () => {
+    const a = await host(); const b = await host();
+    const pasted = { type: "image", data: "UE5H", mimeType: "image/png" };
+    a.imageProvider = b.imageProvider = (request) => request.text.includes("shot.png") ? [pasted] : [];
+    await command(a, "look at shot.png");
+    assert.deepEqual(a.userMessages[0]!.content, [{ type: "text", text: "look at shot.png" }, pasted]);
+    a.idle = false; await a.fire("agent_start");
+    await command(b, "and shot.png");
+    assert.equal(b.userMessages.length, 0);
+    await command(a, "done"); a.idle = true; await a.fire("agent_settled");
+    await waitFor(() => b.userMessages.length === 1);
+    assert.deepEqual(b.userMessages[0]!.content, [{ type: "text", text: "and shot.png" }, pasted]);
+    await command(b, "list");
+    assert.equal(b.events.filter(event => event.channel === "pi-images:attachments").length, 1, "reserved words are not prompts");
   });
 
   it("/queue off while running releases at settle without gating later input", async () => {
@@ -231,7 +279,7 @@ describe("repository queue wiring", () => {
 
   it("shutdown is bounded when another process holds the lock", async () => {
     const a = await host(); await command(a, "task");
-    writeFileSync(join(busDir, "queue", `${queueKey(repo)}.lock`), JSON.stringify({ pid: process.pid, token: "held" }), { mode: 0o600 });
+    holdQueueLock(busDir, repo);
     const started = Date.now(); await a.shutdown();
     assert.ok(Date.now() - started < 1000);
     assert.deepEqual(a.callsAfterDeath, []);
@@ -329,14 +377,12 @@ describe("repository queue wiring", () => {
 
   it("a holder removed while input waits for the lock queues again and announces the expired turn", async () => {
     const a = await host({ queuePollMs: 60_000 }); const b = await host({ queuePollMs: 60_000 }); await waiting(a, b);
-    const path = join(busDir, "queue", `${queueKey(repo)}.lock`);
-    writeFileSync(path, JSON.stringify({ pid: process.pid, token: "held" }), { mode: 0o600 });
+    const held = holdQueueLock(busDir, repo);
     const gated = input(a, "next");
     await sleep(40);
     const file = store().read(); file.entries.shift();
     file.entries[0]!.state = "active"; file.entries[0]!.holdExpiresAt = null;
-    writeFileSync(store().path, JSON.stringify(file), { mode: 0o600 });
-    rmSync(path);
+    held.publish(file);
     assert.deepEqual(await gated, { action: "handled" });
     assert.equal(store().read().entries[1]!.endpointId, socket(a).id);
     assert.ok(a.notifications.some(n => /turn had expired/.test(n.message)));
@@ -359,6 +405,97 @@ describe("repository queue wiring", () => {
     assert.ok(a.notifications.some(n => /I\/O failed/.test(n.message)));
   });
 
+  /** An older session-bus (the test runner's pid) holding the v1 turn; returns the file's path and content. */
+  function legacyHolder(): { path: string; v1: string } {
+    mkdirSync(join(busDir, "queue"), { recursive: true, mode: 0o700 });
+    const path = join(busDir, "queue", `${queueKey(repo)}.json`);
+    const v1 = JSON.stringify({ v: 1, repo, entries: [{ id: crypto.randomUUID(), endpointId: "0000abcd", pid: process.ppid, sessionId: "old",
+      title: "old task", state: "active", enqueuedAt: new Date().toISOString(), grantedAt: new Date().toISOString(), holdExpiresAt: null }] });
+    writeFileSync(path, v1, { mode: 0o600 });
+    return { path, v1 };
+  }
+
+  it("holds prompts while an older session holds the v1 turn, keeps their images, and runs them in order once it is gone", async () => {
+    const a = await host({}, { mode: "tui" });
+    const pasted = { type: "image", data: "UE5H", mimeType: "image/png" };
+    a.imageProvider = (request) => request.text.includes("shot.png") ? [pasted] : [];
+    const legacy = legacyHolder();
+    await command(a, "run this task with shot.png");
+    assert.deepEqual(await input(a, "and then this"), { action: "handled" });
+    await new Promise(resolve => setTimeout(resolve, 80)); // the poll keeps holding
+    assert.equal(a.userMessages.length, 0, "nothing runs alongside the older session's turn");
+    assert.ok(a.notifications.some(n => new RegExp(`older session-bus \\(pid ${process.ppid}\\).*held here, not run\\. In that session run /queue off \\(or finish its turn\\), then reload it\\. Keep this session running`).test(n.message)), JSON.stringify(a.notifications));
+    assert.ok(a.notifications.some(n => /^held: an older session-bus/.test(n.message)));
+    assert.equal(a.queueStatuses.at(-1), "queue: held (older session-bus)");
+    assert.equal(store().read().entries.length, 0, "no v2 turn was granted");
+    assert.equal(fs.readFileSync(legacy.path, "utf8"), legacy.v1, "the v1 file is left unchanged");
+    // The supported procedure: in the older session /queue off removes its v1 entry, then it reloads. Held prompts
+    // then run here in order, the first with its image, without this session being reloaded.
+    writeFileSync(legacy.path, JSON.stringify({ v: 1, repo, entries: [] }), { mode: 0o600 });
+    await waitFor(() => a.userMessages.length === 1);
+    assert.deepEqual(a.userMessages[0]!.content, [{ type: "text", text: "run this task with shot.png" }, pasted]);
+    a.idle = false; await a.fire("agent_start");
+    await waitFor(() => a.userMessages.length === 2);
+    assert.deepEqual(a.userMessages[1], { content: "and then this", options: { expandPromptTemplates: true, deliverAs: "followUp" } });
+    assert.equal(store().read().entries[0]!.state, "active");
+    assert.equal(a.queueStatuses.at(-1), "queue: turn");
+  });
+
+  it("a reload while prompts are held returns them in order with their images saved, and submitting them again attaches each image once", async () => {
+    const a = await host();
+    const pasted = { type: "image", data: "UE5H", mimeType: "image/png" };
+    a.imageProvider = (request) => request.text.includes("shot.png") ? [pasted] : [];
+    const legacy = legacyHolder();
+    await command(a, "first with shot.png");
+    await input(a, "second", "rpc", [{ type: "image", data: "QUJD", mimeType: "image/png" }]);
+    await input(a, "third");
+    await a.shutdown("reload");
+    const prompts = a.editorText.split("\n\n");
+    assert.equal(prompts.length, 3, a.editorText);
+    assert.match(prompts[0]!, /^first with shot\.png\n\S+\/pi-clipboard-[0-9a-f-]{36}\.png$/);
+    assert.match(prompts[1]!, /^second\n\S+\/pi-clipboard-[0-9a-f-]{36}\.png$/);
+    assert.equal(prompts[2], "third");
+    assert.equal(fs.readFileSync(legacy.path, "utf8"), legacy.v1);
+    // After the reload the older session is gone and the prompts are submitted again, in order. pi-images attaches
+    // clipboard files named in a prompt (here: a provider that reads them), each image once.
+    writeFileSync(legacy.path, JSON.stringify({ v: 1, repo, entries: [] }), { mode: 0o600 });
+    const b = await host();
+    b.imageProvider = (request) => [...request.text.matchAll(/\S+\/pi-clipboard-[0-9a-f-]{36}\.png/g)]
+      .map(([path]) => ({ type: "image", data: fs.readFileSync(path).toString("base64"), mimeType: "image/png" }))
+      .filter(image => !request.existing.some(other => (other as { data: string }).data === image.data));
+    await command(b, "on");
+    const results = [];
+    for (const prompt of prompts) results.push(await input(b, prompt));
+    assert.deepEqual(results, [
+      { action: "transform", text: prompts[0], images: [pasted] },
+      { action: "transform", text: prompts[1], images: [{ type: "image", data: "QUJD", mimeType: "image/png" }] },
+      { action: "continue" },
+    ]);
+  });
+
+  it("a holder whose v1 peer takes a turn holds new prompts and replays them once the peer is gone", async () => {
+    const a = await host();
+    await command(a, "first task");
+    assert.equal(a.userMessages.length, 1);
+    const legacy = legacyHolder();
+    assert.deepEqual(await input(a, "second task"), { action: "handled" });
+    assert.equal(a.userMessages.length, 1);
+    writeFileSync(legacy.path, JSON.stringify({ v: 1, repo, entries: [] }), { mode: 0o600 });
+    await waitFor(() => a.userMessages.length === 2);
+    assert.equal(a.userMessages[1]!.content, "second task");
+  });
+
+  it("/queue off while held returns held prompts to the editor and runs nothing", async () => {
+    const a = await host();
+    const legacy = legacyHolder();
+    await command(a, "first"); await input(a, "second");
+    await command(a, "off");
+    assert.equal(a.editorText, "first\n\nsecond");
+    await new Promise(resolve => setTimeout(resolve, 60));
+    assert.equal(a.userMessages.length, 0);
+    assert.equal(fs.readFileSync(legacy.path, "utf8"), legacy.v1);
+  });
+
   it("acquiring immediately during an existing run sends a separate model-visible notice before the follow-up", async () => {
     const a = await host(); a.idle = false; await a.fire("agent_start");
     await command(a, "queued task during streaming");
@@ -370,24 +507,24 @@ describe("repository queue wiring", () => {
 
   it("a failed agent_start hold write retries within 500 ms before any snapshot check, without waiting for the poll", async () => {
     const a = await host({ queuePollMs: 60_000 }); await command(a, "task");
-    const path = join(busDir, "queue", `${queueKey(repo)}.lock`);
-    writeFileSync(path, JSON.stringify({ pid: process.pid, token: "held" }), { mode: 0o600 });
+    const held = holdQueueLock(busDir, repo);
     a.idle = false; await a.fire("agent_start");
     assert.notEqual(store().read().entries[0]!.holdExpiresAt, null);
-    rmSync(path);
+    held.release();
     const opened: string[] = [];
-    const snapshotPath = store().path;
     const original = fs.openSync;
     const spy = mock.method(fs, "openSync", (...args: Parameters<typeof fs.openSync>) => {
-      if (String(args[0]) === path || String(args[0]) === snapshotPath) opened.push(String(args[0]));
+      const path = String(args[0]);
+      if (/\.l\.tmp$/.test(path)) opened.push("lock");
+      else if (/\/S\d{15}\.json$/.test(path)) opened.push("snapshot");
       return original(...args);
     });
     syncBuiltinESMExports();
     const started = Date.now();
     try {
-      await waitFor(() => opened.includes(path));
+      await waitFor(() => opened.includes("lock"));
       assert.ok(Date.now() - started < 1200, "retry must be soon, not the 60-second poll");
-      assert.equal(opened[0], path, "the retry must acquire the mutation lock before any queue snapshot read");
+      assert.equal(opened[0], "lock", "the retry must acquire the mutation lock before any queue snapshot read");
       assert.equal(store().read().entries[0]!.holdExpiresAt, null);
     } finally { spy.mock.restore(); syncBuiltinESMExports(); }
   });
@@ -395,22 +532,20 @@ describe("repository queue wiring", () => {
   it("retries a release requested at settle without adding idle grace", async () => {
     const a = await host(); const b = await host({ queuePollMs: 60_000 }); await waiting(a, b);
     await command(a, "done");
-    const path = join(busDir, "queue", `${queueKey(repo)}.lock`);
-    writeFileSync(path, JSON.stringify({ pid: process.pid, token: "held" }), { mode: 0o600 });
+    const held = holdQueueLock(busDir, repo);
     a.idle = true; await a.fire("agent_settled");
     assert.equal(store().read().entries[0]!.holdExpiresAt, null, "release failure does not start a grace period");
-    rmSync(path);
+    held.release();
     await waitFor(() => b.userMessages.length === 1);
   });
 
   it("off restores text and disables gating even if removal fails, then retries the removal", async () => {
     const a = await host(); const b = await host(); await waiting(a, b);
-    const path = join(busDir, "queue", `${queueKey(repo)}.lock`);
-    writeFileSync(path, JSON.stringify({ pid: process.pid, token: "held" }), { mode: 0o600 });
+    const held = holdQueueLock(busDir, repo);
     await command(b, "off");
     assert.equal(b.editorText, "B's task");
     assert.equal(await input(b, "not gated"), undefined);
-    rmSync(path);
+    held.release();
     await waitFor(() => store().read().entries.length === 1);
     assert.equal(b.userMessages.length, 0);
   });
@@ -435,14 +570,12 @@ describe("repository queue wiring", () => {
     const b = await host({ queuePollMs: 60_000, now: () => clock });
     await command(a, "A's task");
     await command(b, "B's task");
-    const path = join(busDir, "queue", `${queueKey(repo)}.lock`);
-    writeFileSync(path, JSON.stringify({ pid: process.pid, token: "holder-writing" }), { mode: 0o600 });
+    const held = holdQueueLock(busDir, repo); // the holder is writing
     clock = store().read().entries[0]!.holdExpiresAt! + 1;
     await sendQueueNudge(socket(b).path, queueKey(repo));
     await sleep(30); // B saw expiry, but cannot normalize while the holder's write is locked.
     const snapshot = store().read(); snapshot.entries[0]!.holdExpiresAt = null;
-    writeFileSync(store().path, JSON.stringify(snapshot), { mode: 0o600 });
-    rmSync(path);
+    held.publish(snapshot);
     await sleep(70);
     assert.equal(b.userMessages.length, 0);
     assert.equal(store().read().entries[0]!.endpointId, socket(a).id);

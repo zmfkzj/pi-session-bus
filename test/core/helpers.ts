@@ -1,9 +1,11 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { encodeFrame, FrameDecoder, type PeerInfo } from "../../src/core/protocol.ts";
+import { clock, lockName, snapshotName } from "../../src/core/queue-log.ts";
+import { queueKey, type QueueFile } from "../../src/core/queue.ts";
 
 /** Short temp dirs (Unix socket paths are limited to ~103 bytes). Never touches ~/.pi. */
 export function makeTempDir(label = "sb"): string {
@@ -12,6 +14,52 @@ export function makeTempDir(label = "sb"): string {
 
 export function removeTempDir(dir: string): void {
   rmSync(dir, { recursive: true, force: true });
+}
+
+/** The queue's v2 directory (lock generations `L…`, snapshots `S….json`), created like the store does. */
+export function queueLogDir(busDir: string, repo: string): string {
+  const dir = join(busDir, "queue", `${queueKey(repo)}.v2`);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+function newest(dir: string, prefix: "L" | "S", below = Number.MAX_SAFE_INTEGER): number {
+  let gen = 0;
+  for (const name of readdirSync(dir)) {
+    const match = new RegExp(`^${prefix}(\\d{15})(?:\\.json)?$`).exec(name);
+    if (match && Number(match[1]) < below) gen = Math.max(gen, Number(match[1]));
+  }
+  return gen;
+}
+export interface HeldQueueLock { gen: number; path: string; release(): void; publish(content: QueueFile | string): void }
+/**
+ * Takes the next lock generation for another, live process (by default the test runner, `process.ppid`), as a
+ * session in its critical section would, stamped by the protocol's (possibly simulated) monotonic clock unless
+ * `stamp` overrides it (`null`: no stamp, as written by an unstamped lock). `release()` publishes the unchanged
+ * newest snapshot, `publish()` a new one.
+ */
+export function holdQueueLock(busDir: string, repo: string, pid = process.ppid, after: "committed" | "reclaimed" = "committed",
+  stamp: { mono?: number; boot?: string } | null = {}): HeldQueueLock {
+  const dir = queueLogDir(busDir, repo);
+  const gen = newest(dir, "L") + 1;
+  const path = join(dir, lockName(gen));
+  const stamped = stamp === null ? {} : { mono: stamp.mono ?? clock.mono(), ...(stamp.boot ?? clock.boot ? { boot: stamp.boot ?? clock.boot } : {}) };
+  writeFileSync(path, JSON.stringify({ v: 2, pid, token: `test-${gen}`, after, ...stamped }), { mode: 0o600, flag: "wx" });
+  const publish = (content: QueueFile | string): void => {
+    writeFileSync(join(dir, snapshotName(gen)), typeof content === "string" ? content : JSON.stringify(content), { mode: 0o600 });
+  };
+  return {
+    gen, path, publish,
+    release() {
+      const base = newest(dir, "S", gen);
+      publish(base ? readFileSync(join(dir, snapshotName(base)), "utf8") : JSON.stringify({ v: 1, repo, entries: [] }));
+    },
+  };
+}
+/** Publishes `content` as a new committed generation, as another session's mutation would. */
+export function writeQueueSnapshot(busDir: string, repo: string, content: QueueFile | string): number {
+  const held = holdQueueLock(busDir, repo);
+  held.publish(content);
+  return held.gen;
 }
 
 export interface RawResult {
