@@ -47,6 +47,7 @@ import {
   type WakeSuppressReason,
 } from "./core/index.ts";
 import { createQueueWiring } from "./queue.ts";
+import { completeBusArguments } from "./completions.ts";
 
 /** Run mode of the host: "tui" | "rpc" | "json" | "print". */
 export type SessionBusMode = ExtensionContext["mode"];
@@ -622,6 +623,7 @@ export function createSessionBusExtension(options: SessionBusOptions = {}): (pi:
 
     pi.registerCommand("bus", {
       description: "Session bus: /bus [list] | /bus send <to> <text> | /bus wake on|off",
+      getArgumentCompletions: completeBusArguments,
       handler: async (args, c) => {
         const text = args.trim();
         const match = /^(\S+)(?:\s+([\s\S]*))?$/.exec(text);

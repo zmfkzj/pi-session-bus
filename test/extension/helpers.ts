@@ -22,6 +22,7 @@ export interface FakeTool {
 
 export interface FakeCommand {
   description?: string;
+  getArgumentCompletions?: (prefix: string) => { value: string; label: string; description?: string }[] | null;
   handler(args: string, ctx: ExtensionContext): Promise<void>;
 }
 

@@ -8,6 +8,7 @@ import { join } from "node:path";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, InputEvent, InputEventResult } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { completeQueueArguments } from "./completions.ts";
 import { createQueueStore, LegacyQueueError, nudgePromoted, probeHolder, QueueFencedError, type QueueEntry, type QueueMutation, type QueueStore } from "./core/index.ts";
 
 export const QUEUE_STATUS_KEY = "session-bus-queue";
@@ -493,6 +494,7 @@ export function createQueueWiring(pi: ExtensionAPI, options: QueueWiringOptions)
   });
   pi.registerCommand("queue", {
     description: "Repository work queue: /queue [list|on|off|done|<prompt>]",
+    getArgumentCompletions: completeQueueArguments,
     async handler(args) {
       // An extension command never reaches input handlers: attach pasted images of a prompt before any await.
       const words = args.trim();
