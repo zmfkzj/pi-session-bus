@@ -445,6 +445,9 @@ export function createQueueWiring(pi: ExtensionAPI, options: QueueWiringOptions)
     return checking;
   }
 
+  // The turn notice of an idle acquisition goes once, with whichever run starts first: on Pi 1.2.0+ that may also be a run a
+  // triggerTurn message starts (`messageType: "custom"`, e.g. a woken peer note), not only the user's prompt. It states the
+  // session's queue state, so either run may carry it; older hosts emit this event for user prompts only.
   pi.on("before_agent_start", () => {
     if (!live || closing || role !== "holding" || !noticePending) return;
     try { const message = turnMessage(); noticePending = false; return { message }; }

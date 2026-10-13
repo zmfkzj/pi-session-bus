@@ -6,7 +6,8 @@
  *     (only in the allowed modes, never on win32) and `session_shutdown` stops it (idempotent);
  *   - an incoming note becomes a `session-bus.message` custom message: when the wake policy allows,
  *     `pi.sendMessage(..., {triggerTurn: true, deliverAs: "steer"})` (idle: starts a turn; busy: injected
- *     at the next turn boundary without aborting running tools), otherwise `{triggerTurn: false}`;
+ *     at the next turn boundary without aborting running tools; Pi 1.2.0+ counts a run that is still starting
+ *     as busy, so a note then joins that run and is reported "queued"), otherwise `{triggerTurn: false}`;
  *   - tools `session_list` / `session_send` and the `/bus` command send notes (also from print/json mode,
  *     where the sender is simply not replyable);
  *   - after shutdown no `pi.*` / `ctx.*` call is made.

@@ -64,6 +64,17 @@ describe("repository queue wiring", () => {
     assert.equal(a.queueStatuses.at(-1), "queue: turn (idle)");
   });
 
+  it("the turn notice goes once with whichever run starts first, also one a custom message starts (Pi 1.2.0+ before_agent_start)", async () => {
+    const a = await host({}, { mode: "tui" });
+    await command(a, "work on it");
+    const message = { role: "custom", customType: "peer-note", content: "note", display: true, timestamp: Date.now() };
+    const custom = await a.fire("before_agent_start", { messageType: "custom", message }) as { message: { customType: string; content: string } };
+    assert.equal(custom.message.customType, QUEUE_MESSAGE_TYPE);
+    assert.match(custom.message.content, /holds the repository work-queue turn/);
+    assert.equal(await a.fire("before_agent_start", { messageType: "user", prompt: "work on it" }), undefined, "once per acquisition");
+    assert.equal(await a.fire("before_agent_start", { messageType: "custom", message }), undefined);
+  });
+
   it("defers interactive and RPC input, replays on nudge exactly once with template expansion, and queues remaining prompts in order", async () => {
     const a = await host(); const b = await host({ queuePollMs: 60_000 });
     await waiting(a, b);
