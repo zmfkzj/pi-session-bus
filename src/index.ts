@@ -49,6 +49,8 @@ import {
 } from "./core/index.ts";
 import { createQueueWiring } from "./queue.ts";
 import { completeBusArguments } from "./completions.ts";
+import { formatDependencyReport, registerDependencyProvider } from "./dependencies.ts";
+import { DEPENDENCY_LABEL, createSessionBusDependencyProvider, type SessionBusDependencyOptions } from "./doctor.ts";
 
 /** Run mode of the host: "tui" | "rpc" | "json" | "print". */
 export type SessionBusMode = ExtensionContext["mode"];
@@ -70,7 +72,7 @@ export interface SessionBusMessageEvent {
   hops: number;
 }
 export const STATUS_KEY = "session-bus";
-export const USAGE = "Usage: /bus [list] | /bus send <to> <text> | /bus wake on|off";
+export const USAGE = "Usage: /bus [list] | /bus send <to> <text> | /bus wake on|off | /bus doctor | /bus install-deps";
 export const DEFAULT_ALLOWED_MODES: readonly SessionBusMode[] = ["tui", "rpc"];
 
 export interface SessionBusOptions {
@@ -102,6 +104,8 @@ export interface SessionBusOptions {
   gitToplevel?: (cwd: string) => Promise<string> | string;
   /** Directory for images of queued prompts restored to the editor (default: the system temporary directory). */
   queueImageDir?: string;
+  /** Seams of `/bus doctor` / `/bus install-deps` (env, PATH dirs, process runner, uid, tmpdir). */
+  dependencies?: SessionBusDependencyOptions;
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +215,19 @@ export function createSessionBusExtension(options: SessionBusOptions = {}): (pi:
       ...(options.gitToplevel === undefined ? {} : { gitToplevel: options.gitToplevel }),
       ...(options.queueImageDir === undefined ? {} : { imageDir: () => options.queueImageDir! }),
     });
+
+    // Dependency contract: answer the umbrella's requests from load on and back `/bus doctor|install-deps`.
+    const dependencyProvider = createSessionBusDependencyProvider({
+      platform,
+      busDir,
+      allowedModes,
+      endpoint: () => ({ running: endpoint?.running === true, ...(endpoint?.running ? { id: endpoint.id } : {}) }),
+    }, options.dependencies);
+    try {
+      if (pi.events) registerDependencyProvider(pi.events, dependencyProvider);
+    } catch {
+      /* no event bus (old host) */
+    }
 
     function notifyOnce(key: string, message: string, level: "info" | "warning" | "error"): void {
       if (notified.has(key) || !active || !ctx) return;
@@ -623,7 +640,7 @@ export function createSessionBusExtension(options: SessionBusOptions = {}): (pi:
     // -- /bus ----------------------------------------------------------------
 
     pi.registerCommand("bus", {
-      description: "Session bus: /bus [list] | /bus send <to> <text> | /bus wake on|off",
+      description: "Session bus: /bus [list] | /bus send <to> <text> | /bus wake on|off | /bus doctor | /bus install-deps",
       getArgumentCompletions: completeBusArguments,
       handler: async (args, c) => {
         const text = args.trim();
@@ -631,6 +648,18 @@ export function createSessionBusExtension(options: SessionBusOptions = {}): (pi:
         const cmd = match ? match[1]!.toLowerCase() : "list";
         const rest = match ? (match[2] ?? "").trim() : "";
 
+        // `doctor` / `install-deps` (alone) run before the platform gate: they explain an unsupported platform too.
+        if ((cmd === "doctor" || cmd === "install-deps") && rest === "") {
+          const mode = cmd === "doctor" ? "check" : "install";
+          try {
+            const report = mode === "check" ? await dependencyProvider.check(c) : await dependencyProvider.install(c);
+            const { text: out, level } = formatDependencyReport(DEPENDENCY_LABEL, report, mode);
+            c.ui.notify(out, level);
+          } catch (err) {
+            c.ui.notify(`${DEPENDENCY_LABEL} ${cmd} failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+          }
+          return;
+        }
         if (!supported) {
           c.ui.notify(UNSUPPORTED, "error");
           return;

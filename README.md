@@ -38,8 +38,12 @@ You can also message a session yourself: `/bus send <id-or-name> <text>`.
 | `/bus` or `/bus list` | Show this session and the live peers. |
 | `/bus send <to> <text>` | Send a note yourself (always hop 1). |
 | `/bus wake on\|off` | Turn auto-wake for this session on or off (resets on `/reload`, `/new`, ...). |
+| `/bus doctor` | Read-only health check of the runtime prerequisites (see [Health check](#health-check-bus-doctor-and-bus-install-deps)). |
+| `/bus install-deps` | Installs nothing automatically (there is nothing to install); lists manual steps for missing prerequisites. |
 
-Anything else prints `Usage: /bus [list] | /bus send <to> <text> | /bus wake on|off`.
+Anything else prints `Usage: /bus [list] | /bus send <to> <text> | /bus wake on|off | /bus doctor | /bus install-deps`.
+
+`doctor` and `install-deps` are recognised only as the whole argument (case-insensitive): `/bus send doctor <text>` still sends to a peer named `doctor`, and `/bus doctor extra` prints the usage. Before these subcommands existed, `/bus doctor` printed the usage too, so no existing input changes meaning. `/queue` reserves no new words.
 
 `session_send` fails with a tool error, never silently, when the target is ambiguous (the candidates are listed), is this session itself, unknown, unreachable, rejects the note, does not answer within 3 s, or the message is too large (32 KiB of content).
 
@@ -181,6 +185,21 @@ One request per connection. A frame is one line of JSON terminated by LF (UTF-8,
 ```
 
 Delivery calls `pi.sendMessage({customType: "session-bus.message", ...})` with `{triggerTurn: true, deliverAs: "steer"}` when waking and `{triggerTurn: false}` otherwise. `wake` in the response is `started` when the recipient was idle, `queued` when it was busy and `suppressed` when the policy said no.
+
+## Health check: `/bus doctor` and `/bus install-deps`
+
+session-bus has no npm runtime packages, but "nothing to install" does not mean healthy. `/bus doctor` checks these runtime prerequisites without changing anything (it creates no directory, changes no mode and runs only `git --version` and `git rev-parse --show-toplevel`, each limited to 5 s):
+
+| Item | Required? | Problems reported |
+|---|---|---|
+| `platform` | required | Windows: `error`. Unix domain sockets are needed; use Linux, macOS or WSL. |
+| `bus directory` | required | The bus dir (`$PI_SESSION_BUS_DIR` or `<agentDir>/session-bus`) must be a real directory you own and can write, or must be creatable. A symlink, a non-directory, a directory owned by someone else, a directory you cannot write, or an unwritable parent is an `error`. A mode other than 0700 is reported but is `ok`, because session-bus sets 0700 when it starts. |
+| `socket path length` | required | Socket paths must fit in 103 bytes. If the bus dir path is too long, the private fallback (`$XDG_RUNTIME_DIR` or the temporary dir) is checked. If even that is too long or unusable, it is an `error` and you should set a shorter `PI_SESSION_BUS_DIR`. |
+| `receiving (run mode)` | required for receiving | TUI/RPC with a running endpoint: `ok`. TUI/RPC without an endpoint: `error`. Print/json mode: `unverified`, because this session can send but not receive. |
+| `git` | optional (`/queue`) | git is missing from PATH or `git --version` fails: `warn`. |
+| `git work tree` | optional, per use (`/queue`) | The current cwd is not inside a git work tree: `warn`, because `/queue` works only inside a repository. |
+
+`/bus install-deps` installs nothing and says so. Items that are present are reported as `ok` (already available). Missing or broken prerequisites are reported as `manual`, with the exact step to take (install git with your system package manager, set `PI_SESSION_BUS_DIR`, use Linux/macOS/WSL, ...). It never runs sudo, a package manager or `mkdir`, and you can run it as often as you like. Both subcommands also answer the umbrella's `/oh-my-pi doctor|install-deps` (provider id `session-bus`, channel `oh-my-pi-extensions:dependencies`; see `src/dependencies.ts`). Both also run on Windows, where they explain why the platform is unsupported.
 
 ## Limitations
 

@@ -10,6 +10,8 @@ export const BUS_COMPLETIONS: readonly CommandCompletion[] = [
   { value: "send ", label: "send <to> <text>", description: "Send a note to another session and wake it" },
   { value: "wake on", label: "wake on", description: "Let incoming notes wake this session" },
   { value: "wake off", label: "wake off", description: "Do not let incoming notes wake this session" },
+  { value: "doctor", label: "doctor", description: "Check the session-bus runtime prerequisites (read-only)" },
+  { value: "install-deps", label: "install-deps", description: "Install what can be installed; list manual steps for the rest" },
 ];
 
 export const QUEUE_COMPLETIONS: readonly CommandCompletion[] = [

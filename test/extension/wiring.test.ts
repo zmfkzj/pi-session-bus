@@ -678,12 +678,12 @@ describe("/bus command", () => {
     const host = makeHost();
     await host.start();
     const target = await addPeer("peer-session", "peer");
-    for (const args of ["bogus", "send", "send peer", "send   ", "wake", "wake maybe", "list extra", "wake on off"]) {
+    for (const args of ["bogus", "send", "send peer", "send   ", "wake", "wake maybe", "list extra", "wake on off", "doctor now", "install-deps all"]) {
       host.notifications.length = 0;
       await host.runCommand(args);
       assert.deepEqual(host.notifications, [{ message: USAGE, level: "warning" }], `args: ${JSON.stringify(args)}`);
     }
-    assert.equal(USAGE, "Usage: /bus [list] | /bus send <to> <text> | /bus wake on|off");
+    assert.equal(USAGE, "Usage: /bus [list] | /bus send <to> <text> | /bus wake on|off | /bus doctor | /bus install-deps");
     assert.deepEqual(target.notes, []);
     assert.deepEqual(host.sent, []);
   });

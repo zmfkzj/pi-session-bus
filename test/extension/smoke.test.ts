@@ -179,7 +179,7 @@ describe("smoke: real pi in rpc mode", { skip: ENABLED ? false : "opt-in: set SE
 
     await rpc({ type: "prompt", message: "/bus nonsense" });
     await waitFor("the usage notification", () =>
-      notifications().find((m) => m === "Usage: /bus [list] | /bus send <to> <text> | /bus wake on|off"),
+      notifications().find((m) => m === "Usage: /bus [list] | /bus send <to> <text> | /bus wake on|off | /bus doctor | /bus install-deps"),
     );
     assert.equal(records.some((r) => r.type === "agent_start"), false, "still no agent run");
   });
