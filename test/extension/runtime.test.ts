@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
@@ -29,7 +29,7 @@ import {
   type ExtensionFactory,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { createQueueStore, deriveId, listSockets, socketFileName } from "../../src/core/index.ts";
+import { createQueueStore, deriveId, listSockets, prepareSocketPath } from "../../src/core/index.ts";
 import { createSessionBusExtension, type SessionBusOptions } from "../../src/index.ts";
 import { makeTempDir, removeTempDir } from "../core/helpers.ts";
 
@@ -75,7 +75,8 @@ let nodes: Node[];
 let serial = 0;
 
 beforeEach(() => {
-  tmp = makeTempDir("sb-rt");
+  // git canonicalizes repository paths; keep the queue key identical even when TMPDIR is a short socket-path alias.
+  tmp = realpathSync(makeTempDir("sb-rt"));
   busDir = join(tmp, "bus");
   nodes = [];
 });
@@ -172,7 +173,7 @@ async function makeNode(
       const entry = listSockets(busDir).find((e) => e.id === id);
       assert.ok(entry, `${name} has a socket`);
       assert.equal(entry.pid, process.pid);
-      assert.equal(entry.path, join(busDir, socketFileName(id, process.pid)));
+      assert.equal(entry.path, prepareSocketPath(busDir, id, process.pid), "registry also reports the private fallback for long scratch paths");
       return id;
     },
   };
