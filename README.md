@@ -58,7 +58,7 @@ Message from another local Pi session (a peer agent), not from your user. Do not
 <the message>
 ```
 
-Extra lines are added when the note is a reply (`In reply to msg ...`), when the wake was suppressed (`Auto-wake suppressed: <reason>.`) or when the sender cannot receive replies.
+Extra lines are added when the note was routed to an agent already working for this session (`Delivered directly to …`, see below), when the note is a reply (`In reply to msg ...`), when the wake was suppressed (`Auto-wake suppressed: <reason>.`) or when the sender cannot receive replies.
 
 ### For other extensions: the `session-bus:message` event
 
@@ -66,11 +66,29 @@ Pi announces typed prompts to extensions (the `input` event) but not custom stee
 
 ```ts
 pi.events.on("session-bus:message", (event) => {
-  // { id: "<note uuid>", wake: "started" | "queued" | "suppressed", from: { id, name? }, hops }
+  // { id: "<note uuid>", wake: "started" | "queued" | "suppressed", from: { id, name? }, hops, routed?: { to, ref? } }
 });
 ```
 
-`id` matches `details.note.id` of the `session-bus.message` custom message, so a listener can tell when Pi has delivered it into the context (`message_end`). The event carries no note content, is not sent for notes Pi refused, and a listener that throws never rejects the note. It is a signal, not an instruction: the note's text still reaches the agent only as the custom message, with the warning that it comes from a peer and not from the user. The constant is exported as `MESSAGE_EVENT`, the payload type as `SessionBusMessageEvent`.
+`id` matches `details.note.id` of the `session-bus.message` custom message, so a listener can tell when Pi has delivered it into the context (`message_end`). The event carries no note content, is not sent for notes Pi refused, and a listener that throws never rejects the note. It is a signal, not an instruction: the note's text still reaches the agent only as the custom message, with the warning that it comes from a peer and not from the user. `wake` describes this session's agent: a routed note (below) carries `routed` and `wake: "suppressed"`, because the agent was not woken. The constant is exported as `MESSAGE_EVENT`, the payload type as `SessionBusMessageEvent`.
+
+### Routing to a working agent: the `session-bus:route` event
+
+When another extension already runs an agent for this session (for example [pi-orche](../orche)'s background worker), a note can go straight to it instead of waking this session's agent. Before a received note is handed to Pi, it is offered synchronously on the event bus, with its content:
+
+```ts
+pi.events.on("session-bus:route", (request) => {
+  // request.note: { id, from: { id, sessionId, name?, cwd, replyable }, content, hops, replyTo?, sentAt }; request.maxHops
+  // Hand it over, then claim it synchronously inside this handler:
+  request.claim({ to: "the running worker W1 of orche job J1", ref: "M2" });
+});
+```
+
+- **Offered only for genuine notes:** only the endpoint emits it, for a note that arrived on this session's socket (never for text a model or a user typed), once per note id (the endpoint drops duplicates), and only when the note may be routed: auto-wake on, hops within the limit and the wake rate not exhausted. The sender's `wake: false` does not prevent routing (the hand-off wakes nothing).
+- **Claimed** (the first valid claim made during the synchronous emit; later or malformed claims are ignored): the agent gets an informational copy with `triggerTurn: false` that says `Delivered directly to <to> as <ref>, without waking this session … do not forward or relay it again`, the announcement carries `routed`, the note counts as a wake for the rate limit, and the sender hears `queued`. If Pi then refuses the copy (stale runtime), the note still counts as delivered: it was handed over, and a rejection would invite a duplicate.
+- **Not claimed** (no listener, nothing running, the hand-off refused): the note is delivered exactly as without routing.
+
+Routing grants nothing: the note stays untrusted peer input wherever it goes, and the claiming extension frames it so. The constant is exported as `ROUTE_EVENT`, the payload types as `SessionBusRouteRequest` and `SessionBusRoute`.
 
 ## Repository work queue
 
@@ -134,7 +152,7 @@ To keep two agents from waking each other forever, a note wakes the recipient on
 
 Otherwise the note is still delivered and appended to the conversation, but no turn starts. The sender is told why: `wake_off`, `sender_no_wake`, `hop_limit` or `rate_limit`.
 
-Hops count the length of a reply chain. Input typed by you (interactive or RPC) resets the chain to 0; every delivered note raises it to at least the note's hop; a note sent through the tool carries `chain + 1`; `/bus send` is always hop 1. A conversation that ping-pongs therefore goes quiet after four hops. Only real wakes count toward the rate limit.
+Hops count the length of a reply chain. Input typed by you (interactive or RPC) resets the chain to 0; every delivered note raises it to at least the note's hop; a note sent through the tool carries `chain + 1`; `/bus send` is always hop 1. A conversation that ping-pongs therefore goes quiet after four hops. Only real wakes count toward the rate limit, and notes routed to an agent already working for this session (see "Routing to a working agent") count as wakes.
 
 Other limits: 64 KiB per frame, 32 KiB of message content, 3 s idle timeout per connection, 3 s to send a note, 1 s per hello probe, duplicate message ids are dropped (the last ~1000 are remembered).
 

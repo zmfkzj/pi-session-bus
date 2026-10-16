@@ -195,3 +195,20 @@ describe("WakePolicy hop accounting", () => {
     assert.equal(policy.chainHops, 0);
   });
 });
+
+describe("WakePolicy.routable", () => {
+  it("needs auto-wake, hops within the limit and a free wake slot, but not the sender's wake flag; it changes nothing", () => {
+    const { policy, clock } = makePolicy({ maxHops: 2, maxWakesPerMinute: 1, wakeWindowMs: 1000 });
+    assert.equal(policy.routable({ hops: 1 }), true);
+    assert.equal(policy.routable({ hops: 2 }), true);
+    assert.equal(policy.routable({ hops: 3 }), false);
+    assert.deepEqual(policy.decide({ hops: 1, wake: false }), { wake: false, reason: "sender_no_wake" });
+    assert.equal(policy.recentWakes(), 0, "side-effect free");
+    policy.recordWake();
+    assert.equal(policy.routable({ hops: 1 }), false, "the wake rate bounds routing");
+    clock.t += 1000;
+    assert.equal(policy.routable({ hops: 1 }), true);
+    policy.autoWake = false;
+    assert.equal(policy.routable({ hops: 1 }), false);
+  });
+});

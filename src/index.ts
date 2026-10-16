@@ -8,6 +8,9 @@
  *     `pi.sendMessage(..., {triggerTurn: true, deliverAs: "steer"})` (idle: starts a turn; busy: injected
  *     at the next turn boundary without aborting running tools; Pi 1.2.0+ counts a run that is still starting
  *     as busy, so a note then joins that run and is reported "queued"), otherwise `{triggerTurn: false}`;
+ *   - before that, a note that may be routed (auto-wake on, within the hop and rate limits) is offered to other
+ *     extensions on {@link ROUTE_EVENT}: when one claims it (pi-orche: its running worker accepted it), the agent gets
+ *     an informational copy without a wake (`{triggerTurn: false}`) and the sender hears "queued";
  *   - tools `session_list` / `session_send` and the `/bus` command send notes (also from print/json mode,
  *     where the sender is simply not replyable);
  *   - after shutdown no `pi.*` / `ctx.*` call is made.
@@ -66,10 +69,48 @@ export const MESSAGE_EVENT = "session-bus:message";
 export interface SessionBusMessageEvent {
   /** The note id (`details.note.id` of the custom message). */
   id: string;
-  /** "started" | "queued": the note wakes the agent; "suppressed": delivered without a wake. */
+  /**
+   * Whether the note wakes this session's agent: "started" | "queued": it does; "suppressed": delivered without a wake (a
+   * suppressed note, or a routed one: see `routed`).
+   */
   wake: WakeStatus;
   from: { id: string; name?: string };
   hops: number;
+  /** Set when an extension claimed the note on {@link ROUTE_EVENT}: where it went. The agent was not woken. */
+  routed?: SessionBusRoute;
+}
+/**
+ * `pi.events` channel on which a received note is offered, synchronously and BEFORE it is handed to Pi, to an extension that
+ * has an agent already working for this session (pi-orche: the worker of its running background job). Payload:
+ * {@link SessionBusRouteRequest}. Offered only for a genuine note from the bus endpoint (never for text a model or user typed),
+ * once per note id (the endpoint drops duplicates), and only when the note may be routed (auto-wake on, hops within the limit,
+ * wake rate not exhausted; the sender's wake flag is not needed). A listener that has really handed the note over calls `claim`
+ * synchronously inside its handler; a later call is ignored, the first claim wins. Claimed: the note goes to this session's agent
+ * as an informational copy without a wake (it says where the note went), counts as a wake for the rate limit, and the sender
+ * hears "queued". Unclaimed (no listener, nothing running, the hand-off refused): delivered as before.
+ * Routing grants nothing: the note stays untrusted peer input wherever it goes.
+ */
+export const ROUTE_EVENT = "session-bus:route";
+export interface SessionBusRoute {
+  /** Where the note went, for the agent's copy and for other listeners (e.g. "the running worker W2 of orche job J1"). */
+  to: string;
+  /** The receiver's own id of the delivery (e.g. "M3"), if any. */
+  ref?: string;
+}
+export interface SessionBusRouteRequest {
+  /** The note as received (peer-controlled fields: treat them as untrusted). */
+  note: {
+    id: string;
+    from: { id: string; sessionId: string; name?: string; cwd: string; replyable: boolean };
+    content: string;
+    hops: number;
+    replyTo?: string;
+    sentAt: string;
+  };
+  /** The hop limit of this session (for a `hop h/max` header). */
+  maxHops: number;
+  /** Claim the note: it was handed over to `route.to`. Call synchronously inside the handler; only the first claim counts. */
+  claim(route: SessionBusRoute): void;
 }
 export const STATUS_KEY = "session-bus";
 export const USAGE = "Usage: /bus [list] | /bus send <to> <text> | /bus wake on|off | /bus doctor | /bus install-deps";
@@ -274,20 +315,62 @@ export function createSessionBusExtension(options: SessionBusOptions = {}): (pi:
 
     // -- receiving -----------------------------------------------------------
 
+    /**
+     * Offer a routable note on {@link ROUTE_EVENT} (see there) and return the claim, if an extension made one. Claims are
+     * accepted only while the synchronous emit runs; a malformed claim or a throwing listener counts as no claim.
+     */
+    function offerRoute(note: NoteRequest): SessionBusRoute | undefined {
+      if (!pi.events || !policy.routable(note)) return undefined;
+      let open = true;
+      let route: SessionBusRoute | undefined;
+      const request: SessionBusRouteRequest = {
+        note: {
+          id: note.id,
+          from: {
+            id: note.from.id,
+            sessionId: note.from.sessionId,
+            ...(note.from.name === undefined ? {} : { name: note.from.name }),
+            cwd: note.from.cwd,
+            replyable: note.from.replyable,
+          },
+          content: note.content,
+          hops: note.hops,
+          ...(note.replyTo === undefined ? {} : { replyTo: note.replyTo }),
+          sentAt: note.sentAt,
+        },
+        maxHops: policy.maxHops,
+        claim: (claimed) => {
+          if (!open || route || typeof claimed?.to !== "string" || flat(claimed.to).length === 0) return;
+          route = { to: flat(claimed.to, 160), ...(typeof claimed.ref === "string" && flat(claimed.ref).length > 0 ? { ref: flat(claimed.ref, 32) } : {}) };
+        },
+      };
+      try {
+        pi.events.emit(ROUTE_EVENT, request);
+      } catch {
+        /* a stale runtime or a throwing bus: whatever was claimed before the throw stands (it was handed over) */
+      }
+      open = false;
+      return route;
+    }
+
     function handleNote(note: NoteRequest): NoteResponse {
       const c = ctx;
       if (!active || !c) return rejected("shutting down");
       const decision = policy.decide(note);
-      const suppressedReason = decision.wake ? undefined : decision.reason;
       let idle: boolean;
       try {
         idle = c.isIdle();
       } catch {
         return rejected("shutting down");
       }
-      const wake: WakeStatus = !decision.wake ? "suppressed" : idle ? "started" : "queued";
-      const details: { note: NoteRequest; wake: WakeStatus; reason?: WakeSuppressReason } = { note, wake };
+      // Handed to an agent already working for this session (e.g. pi-orche's running worker): this session is not woken.
+      const routed = offerRoute(note);
+      const suppressedReason = decision.wake || routed ? undefined : decision.reason;
+      const wakesAgent = decision.wake && !routed;
+      const wake: WakeStatus = routed ? "queued" : !decision.wake ? "suppressed" : idle ? "started" : "queued";
+      const details: { note: NoteRequest; wake: WakeStatus; reason?: WakeSuppressReason; routed?: SessionBusRoute } = { note, wake: routed ? "suppressed" : wake };
       if (suppressedReason !== undefined) details.reason = suppressedReason;
+      if (routed) details.routed = routed;
       try {
         pi.sendMessage(
           {
@@ -295,22 +378,30 @@ export function createSessionBusExtension(options: SessionBusOptions = {}): (pi:
             content: formatNoteText(note, {
               maxHops: policy.maxHops,
               ...(suppressedReason === undefined ? {} : { suppressedReason }),
+              ...(routed ? { routedTo: `${routed.to}${routed.ref ? ` as ${routed.ref}` : ""}` } : {}),
             }),
             display: true,
             details,
           },
-          decision.wake ? { triggerTurn: true, deliverAs: "steer" } : { triggerTurn: false },
+          wakesAgent ? { triggerTurn: true, deliverAs: "steer" } : { triggerTurn: false },
         );
       } catch {
-        return rejected("shutting down");
+        // A routed note was already handed over: rejecting it now would invite a resend and a duplicate there.
+        if (!routed) return rejected("shutting down");
       }
-      // Account for the note only once pi accepted it: a failed sendMessage (stale runtime) must not
-      // consume a wake slot or advance the hop chain.
+      // Account for the note only once pi accepted it (or it was routed): a failed sendMessage (stale runtime) must not
+      // consume a wake slot or advance the hop chain. A routed note counts as a wake: the rate limit bounds routing too.
       policy.onDelivered(note.hops);
-      if (decision.wake) policy.recordWake();
+      if (wakesAgent || routed) policy.recordWake();
       // Announce it to other extensions (best effort: a listener's failure must not reject an accepted note).
       try {
-        const event: SessionBusMessageEvent = { id: note.id, wake, from: { id: note.from.id, ...(note.from.name ? { name: note.from.name } : {}) }, hops: note.hops };
+        const event: SessionBusMessageEvent = {
+          id: note.id,
+          wake: details.wake,
+          from: { id: note.from.id, ...(note.from.name ? { name: note.from.name } : {}) },
+          hops: note.hops,
+          ...(routed ? { routed } : {}),
+        };
         pi.events?.emit(MESSAGE_EVENT, event);
       } catch {
         /* no event bus (old host) or a stale runtime */

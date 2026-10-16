@@ -13,6 +13,12 @@
  * Otherwise it is still delivered, with the first failing reason in the order
  *   wake_off, sender_no_wake, hop_limit, rate_limit.
  * Call `recordWake()` only when a wake is actually performed.
+ *
+ * `routable(note)` (side-effect free) says whether a note may be handed straight to an agent that is
+ * already working for this session (pi-orche's running worker, see the extension's route event):
+ * autoWake is on, note.hops <= maxHops and the wake rate allows one more. The sender's wake flag is
+ * not required: such a hand-off wakes nothing. A routed note counts as a wake (`recordWake()`), so
+ * the rate limit bounds routed notes too.
  */
 
 import type { WakeSuppressReason } from "./protocol.ts";
@@ -87,6 +93,11 @@ export class WakePolicy {
     if (note.hops > this.maxHops) return { wake: false, reason: "hop_limit" };
     if (this.recentWakes() >= this.maxWakesPerMinute) return { wake: false, reason: "rate_limit" };
     return { wake: true };
+  }
+
+  /** Whether a note may be routed to an agent already working for this session (see the header). */
+  routable(note: { hops: number }): boolean {
+    return this.#autoWake && note.hops <= this.maxHops && this.recentWakes() < this.maxWakesPerMinute;
   }
 
   /** Record that a wake was actually performed now. */

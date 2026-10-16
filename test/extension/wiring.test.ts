@@ -3,7 +3,7 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, symlinkSync } from "node
 import { createServer, type Server } from "node:net";
 import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import defaultFactory, { createSessionBusExtension, MESSAGE_EVENT, USAGE, type SessionBusOptions } from "../../src/index.ts";
+import defaultFactory, { createSessionBusExtension, MESSAGE_EVENT, ROUTE_EVENT, USAGE, type SessionBusOptions } from "../../src/index.ts";
 import {
   BusClientError,
   createNote,
@@ -339,30 +339,138 @@ describe("delivery into the session", () => {
     await host.start();
     host.idle = false;
     const entry = onlyEntry();
+    const announced = () => host.events.filter((e) => e.channel === MESSAGE_EVENT);
     const pi = host.pi as unknown as { sendMessage: (message: unknown, options?: unknown) => void };
     const realSendMessage = pi.sendMessage;
     let sentBeforeEvent = -1;
     pi.sendMessage = (message, options) => {
       realSendMessage(message, options);
-      sentBeforeEvent = host.events.length;
+      sentBeforeEvent = announced().length;
     };
     const woken = noteTo(entry, { content: "secret body" });
     assert.equal((await sendNote(entry.path, woken)).wake, "queued");
     // the steer was handed to pi before the event (a listener sees it queued)
     assert.equal(sentBeforeEvent, 0);
-    assert.deepEqual(host.events, [{ channel: MESSAGE_EVENT, data: { id: woken.id, wake: "queued", from: { id: "feedc0de", name: "sender" }, hops: 1 } }]);
-    assert.ok(!JSON.stringify(host.events).includes("secret body"));
+    assert.deepEqual(announced(), [{ channel: MESSAGE_EVENT, data: { id: woken.id, wake: "queued", from: { id: "feedc0de", name: "sender" }, hops: 1 } }]);
+    assert.ok(!JSON.stringify(announced()).includes("secret body"));
     const quiet = noteTo(entry, { hops: 5 });
     assert.equal((await sendNote(entry.path, quiet)).wake, "suppressed");
-    assert.deepEqual(host.events[1], { channel: MESSAGE_EVENT, data: { id: quiet.id, wake: "suppressed", from: { id: "feedc0de", name: "sender" }, hops: 5 } });
+    assert.deepEqual(announced()[1], { channel: MESSAGE_EVENT, data: { id: quiet.id, wake: "suppressed", from: { id: "feedc0de", name: "sender" }, hops: 5 } });
     // a note pi refused is not announced
     pi.sendMessage = () => { throw new Error("stale extension runtime: pi.sendMessage"); };
     await assert.rejects(sendNote(entry.path, noteTo(entry)));
-    assert.equal(host.events.length, 2);
+    assert.equal(announced().length, 2);
     // a throwing event bus does not reject an accepted note
     pi.sendMessage = realSendMessage;
     (host.pi as unknown as { events: { emit: () => void } }).events.emit = () => { throw new Error("listener failed"); };
     assert.equal((await sendNote(entry.path, noteTo(entry))).status, "delivered");
+  });
+
+  describe("routing to an agent already working for this session (ROUTE_EVENT)", () => {
+  const routes = (host: FakeHost) => host.events.filter((e) => e.channel === ROUTE_EVENT);
+
+  it("offers a routable note with its content BEFORE pi gets it; unclaimed, it is delivered exactly as before", async () => {
+    const host = makeHost();
+    await host.start();
+    host.idle = false;
+    const entry = onlyEntry();
+    let sentWhenOffered = -1;
+    host.routeListener = () => { sentWhenOffered = host.sent.length; };
+    const note = noteTo(entry, { content: "peer body", replyTo: "m-0" });
+    const response = await sendNote(entry.path, note);
+    assert.equal(response.wake, "queued");
+    assert.equal(sentWhenOffered, 0);
+    const offered = routes(host)[0]!.data as { note: Record<string, unknown>; maxHops: number };
+    assert.deepEqual(offered.note, {
+      id: note.id, from: { id: "feedc0de", sessionId: "sender-session", name: "sender", cwd: "/sender/cwd", replyable: true },
+      content: "peer body", hops: 1, replyTo: "m-0", sentAt: note.sentAt,
+    });
+    assert.equal(offered.maxHops, MAX_HOPS);
+    assert.equal(host.sent.length, 1);
+    assert.deepEqual(host.sent[0]!.options, { triggerTurn: true, deliverAs: "steer" });
+    assert.equal(host.sent[0]!.message.details.routed, undefined);
+    assert.ok(!host.sent[0]!.message.content.includes("Delivered directly"));
+  });
+
+  it("claimed: the agent gets an informational copy without a wake, the sender hears queued, the announcement says routed", async () => {
+    const host = makeHost();
+    await host.start();
+    const entry = onlyEntry();
+    host.routeListener = (request) => request.claim({ to: "the running worker W2 of orche job J1", ref: "M1" });
+    const note = noteTo(entry, { content: "interface changed" });
+    const response = await sendNote(entry.path, note);
+    assert.equal(response.status, "delivered");
+    assert.equal(response.wake, "queued");
+    assert.equal(response.reason, undefined);
+    assert.equal(host.sent.length, 1);
+    const sent = host.sent[0]!;
+    assert.deepEqual(sent.options, { triggerTurn: false });
+    assert.match(sent.message.content, /^\[session-bus message · from "sender"/);
+    assert.ok(sent.message.content.includes("Delivered directly to the running worker W2 of orche job J1 as M1, without waking this session"));
+    assert.ok(sent.message.content.includes("do not forward or relay it again"));
+    assert.ok(sent.message.content.endsWith("\n\ninterface changed"));
+    assert.ok(!sent.message.content.includes("Auto-wake suppressed"));
+    assert.deepEqual(sent.message.details.routed, { to: "the running worker W2 of orche job J1", ref: "M1" });
+    assert.equal(sent.message.details.wake, "suppressed");
+    const announced = host.events.filter((e) => e.channel === MESSAGE_EVENT);
+    assert.deepEqual(announced, [{ channel: MESSAGE_EVENT, data: { id: note.id, wake: "suppressed", from: { id: "feedc0de", name: "sender" }, hops: 1, routed: { to: "the running worker W2 of orche job J1", ref: "M1" } } }]);
+    // the same id again: the endpoint drops it, nothing is offered or delivered twice
+    assert.equal((await sendNote(entry.path, note)).status, "duplicate");
+    assert.equal(routes(host).length, 1);
+    assert.equal(host.sent.length, 1);
+  });
+
+  it("offers a wake=false note too, but never with auto-wake off, past the hop limit or the wake rate; a routed note uses a wake slot", async () => {
+    const host = makeHost({}, { maxHops: 2, maxWakesPerMinute: 1 });
+    await host.start();
+    const entry = onlyEntry();
+    host.routeListener = (request) => request.claim({ to: "worker" });
+    // wake=false: routed (the hand-off wakes nothing), and it takes the only wake slot
+    assert.equal((await sendNote(entry.path, noteTo(entry, { wake: false }))).wake, "queued");
+    assert.equal(routes(host).length, 1);
+    // rate limit reached: not offered, delivered without a wake as before
+    const limited = await sendNote(entry.path, noteTo(entry));
+    assert.equal(limited.wake, "suppressed");
+    assert.equal(limited.reason, "rate_limit");
+    assert.equal(routes(host).length, 1);
+    // hop limit
+    const far = makeHost({ sessionId: "11111111-aaaa-4bbb-8ccc-000000000002" }, { maxHops: 2 });
+    await far.start();
+    far.routeListener = (request) => request.claim({ to: "worker" });
+    const farEntry = listSockets(busDir).find((e) => e.id === deriveId("11111111-aaaa-4bbb-8ccc-000000000002", process.pid))!;
+    assert.equal((await sendNote(farEntry.path, noteTo(farEntry, { hops: 3 }))).reason, "hop_limit");
+    assert.equal(routes(far).length, 0);
+    // auto-wake off
+    await far.runCommand("wake off");
+    assert.equal((await sendNote(farEntry.path, noteTo(farEntry))).reason, "wake_off");
+    assert.equal(routes(far).length, 0);
+    assert.ok(far.sent.every((s) => s.message.details.routed === undefined));
+  });
+
+  it("ignores a claim made after the synchronous offer, a malformed claim and a second claim", async () => {
+    const host = makeHost();
+    await host.start();
+    const entry = onlyEntry();
+    let late: ((route: { to: string; ref?: string }) => void) | undefined;
+    host.routeListener = (request) => { late = request.claim; };
+    assert.equal((await sendNote(entry.path, noteTo(entry))).wake, "started");
+    late!({ to: "too late" });
+    assert.deepEqual(host.sent[0]!.options, { triggerTurn: true, deliverAs: "steer" });
+    host.routeListener = (request) => { request.claim({ to: "  " }); request.claim({ to: "first" }); request.claim({ to: "second" }); };
+    await sendNote(entry.path, noteTo(entry));
+    assert.deepEqual(host.sent[1]!.message.details.routed, { to: "first" });
+  });
+
+  it("a routed note whose copy pi refuses is still delivered (it was handed over: a rejection would invite a duplicate)", async () => {
+    const host = makeHost();
+    await host.start();
+    const entry = onlyEntry();
+    host.routeListener = (request) => request.claim({ to: "worker", ref: "M1" });
+    (host.pi as unknown as { sendMessage: () => void }).sendMessage = () => { throw new Error("stale extension runtime: pi.sendMessage"); };
+    const response = await sendNote(entry.path, noteTo(entry));
+    assert.equal(response.status, "delivered");
+    assert.equal(response.wake, "queued");
+  });
   });
 
   it("a failed pi.sendMessage rejects the note without consuming a wake slot or advancing the hop chain", async () => {

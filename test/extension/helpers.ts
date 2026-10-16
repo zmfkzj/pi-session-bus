@@ -59,6 +59,8 @@ export class FakeHost {
   readonly events: { channel: string; data: unknown }[] = [];
   /** Stands in for the images extension on its attachments channel (`pi-images:attachments`). */
   imageProvider?: (request: { text: string; existing: readonly unknown[] }) => unknown[];
+  /** Stands in for an extension listening on the route channel (`session-bus:route`, e.g. pi-orche). */
+  routeListener?: (request: { note: Record<string, unknown>; maxHops: number; claim(route: { to: string; ref?: string }): void }) => void;
   editorText = "";
   readonly notifications: Notification[] = [];
   readonly statuses: (string | undefined)[] = [];
@@ -108,6 +110,7 @@ export class FakeHost {
           this.events.push({ channel, data });
           const request = data as { text: string; existing: readonly unknown[]; provide(images: unknown[]): void };
           if (channel === "pi-images:attachments" && this.imageProvider) request.provide(this.imageProvider(request));
+          if (channel === "session-bus:route" && this.routeListener) this.routeListener(data as Parameters<NonNullable<FakeHost["routeListener"]>>[0]);
         },
         on: () => {
           guard("pi.events.on");
