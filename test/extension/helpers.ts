@@ -42,6 +42,7 @@ export interface FakeHostOptions {
   sessionId?: string;
   cwd?: string;
   sessionName?: string;
+  sessionFile?: string;
 }
 
 /**
@@ -57,6 +58,8 @@ export class FakeHost {
   readonly userMessages: { content: string | unknown[]; options?: Record<string, unknown> }[] = [];
   /** `pi.events.emit` calls, in order. */
   readonly events: { channel: string; data: unknown }[] = [];
+  /** `pi.events.on` listeners by channel (e.g. orche's worker capability channel). */
+  readonly listeners = new Map<string, ((data: unknown) => void)[]>();
   /** Stands in for the images extension on its attachments channel (`pi-images:attachments`). */
   imageProvider?: (request: { text: string; existing: readonly unknown[] }) => unknown[];
   /** Stands in for an extension listening on the route channel (`session-bus:route`, e.g. pi-orche). */
@@ -111,9 +114,11 @@ export class FakeHost {
           const request = data as { text: string; existing: readonly unknown[]; provide(images: unknown[]): void };
           if (channel === "pi-images:attachments" && this.imageProvider) request.provide(this.imageProvider(request));
           if (channel === "session-bus:route" && this.routeListener) this.routeListener(data as Parameters<NonNullable<FakeHost["routeListener"]>>[0]);
+          for (const listener of this.listeners.get(channel) ?? []) listener(data);
         },
-        on: () => {
+        on: (channel: string, listener: (data: unknown) => void) => {
           guard("pi.events.on");
+          this.listeners.set(channel, [...(this.listeners.get(channel) ?? []), listener]);
           return () => undefined;
         },
       },
@@ -129,6 +134,10 @@ export class FakeHost {
       mode: options.mode ?? "rpc",
       hasUI: options.hasUI ?? true,
       sessionManager: {
+        getSessionFile: () => {
+          guard("ctx.sessionManager.getSessionFile");
+          return options.sessionFile;
+        },
         getSessionId: () => {
           guard("ctx.sessionManager.getSessionId");
           return sessionId;

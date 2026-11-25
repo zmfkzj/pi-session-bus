@@ -49,6 +49,11 @@ Anything else prints `Usage: /bus [list] | /bus send <to> <text> | /bus wake on|
 
 A session started with `pi -p` / `--mode json` has no endpoint and cannot receive, but its agent can still send (the note is marked as not replyable). The tools and `/bus` are registered on Windows but report `unsupported`.
 
+The skill `skills/session-bus/SKILL.md` (registered in `pi.skills`) tells agents when to use the tools (the user asks to
+tell or ask another session or terminal, cross-repository work, shared interface or schema changes, questions another
+live session can answer, replies to session-bus messages), how, and the safety rules. The tool guidelines follow the
+same order: when → how → safety.
+
 ### What the receiving agent sees
 
 ```
@@ -89,6 +94,24 @@ pi.events.on("session-bus:route", (request) => {
 - **Not claimed** (no listener, nothing running, the hand-off refused): the note is delivered exactly as without routing.
 
 Routing grants nothing: the note stays untrusted peer input wherever it goes, and the claiming extension frames it so. The constant is exported as `ROUTE_EVENT`, the payload types as `SessionBusRouteRequest` and `SessionBusRoute`.
+
+### orche workers: the `session-bus` worker capability
+
+[pi-orche](../orche) asks the session's extensions for worker capabilities on `pi.events` channel
+`orche:worker-capability`. pi-session-bus answers `capability: "session-bus"` (exported as `SESSION_BUS_CAPABILITY`)
+once this session started, with `session_list` and `session_send` for that worker's own session:
+
+- **Identity:** the worker has no endpoint of its own. It sends as this session (endpoint id, session id,
+  replyability), with the note's name set to `orche worker <Wn> of <session name>` (the worker id comes from orche's
+  transcript name `workers/<Wn>-<time>.jsonl`). A reply therefore reaches this session's endpoint, where orche routes it
+  to the worker while its job runs; after the job, this session's agent receives it as usual.
+- **No loops through main:** this session stays "self" for the worker: `session_list` shows it apart and
+  `session_send` refuses it as a target (by id, session id or name).
+- **Hops:** never model-supplied. A reply (`replyTo` of a note this session received) continues that note's hop count,
+  and a worker keeps its own chain, so a user message that resets this session's chain mid-job does not reset the
+  worker's; past the hop limit the recipient is not woken.
+- **Effects:** the main session's busy guard in orche is unchanged (its own `session_send` stays blocked while a job
+  runs); `orche_spawn` sub-workers do not ask for this capability.
 
 ## Repository work queue
 

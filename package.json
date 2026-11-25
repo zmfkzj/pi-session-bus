@@ -4,8 +4,8 @@
   "description": "Let separate local Pi sessions exchange messages over Unix sockets and wake each other",
   "type": "module",
   "keywords": ["pi-package", "pi-extension"],
-  "files": ["src", "README.md"],
-  "pi": { "extensions": ["./src/index.ts"] },
+  "files": ["src", "skills", "README.md"],
+  "pi": { "extensions": ["./src/index.ts"], "skills": ["./skills"] },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --test 'test/**/*.test.ts'"
